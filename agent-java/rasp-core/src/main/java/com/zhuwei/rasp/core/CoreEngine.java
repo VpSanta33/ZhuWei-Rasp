@@ -12,6 +12,7 @@ import com.zhuwei.rasp.core.transport.AgentClient;
 import com.zhuwei.rasp.core.transport.Reporter;
 import com.zhuwei.rasp.core.transport.ServerLink;
 import com.zhuwei.rasp.core.util.Guard;
+import com.zhuwei.rasp.core.util.Jdk;
 import com.zhuwei.rasp.core.util.RaspLog;
 
 import java.io.File;
@@ -76,13 +77,8 @@ public final class CoreEngine {
                 link.start();
             }
 
-            Module spyModule = Spy.class.getModule();
-            for (Module m : ModuleLayer.boot().modules()) {
-                if (!m.canRead(spyModule)) {
-                    inst.redefineModule(m, Collections.singleton(spyModule), Collections.emptyMap(),
-                            Collections.emptyMap(), Collections.emptySet(), Collections.emptyMap());
-                }
-            }
+            Object spyModule = Jdk.moduleOf(Spy.class); // null on JDK 8
+            Jdk.allowBootModulesToRead(inst, Spy.class);
             Spy.install(new RaspSpyHandler(reporter));
 
             File dump = s.getBool("debug.dump", false) ? new File(home, "dump") : null;

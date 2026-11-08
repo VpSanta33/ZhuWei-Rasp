@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -114,13 +115,30 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 `
 
+// Full-text index for alarm keyword search (trigram: substring semantics like LIKE '%kw%' for 3+ chars),
+// kept in sync with the alarm table by triggers.
+const ftsSchema = `
+CREATE VIRTUAL TABLE IF NOT EXISTS alarm_fts USING fts5(url, client_ip, hostname, matched_input,
+  content='alarm', content_rowid='rowid', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS alarm_fts_ai AFTER INSERT ON alarm BEGIN
+  INSERT INTO alarm_fts(rowid, url, client_ip, hostname, matched_input) VALUES (new.rowid, new.url, new.client_ip, new.hostname, new.matched_input);
+END;
+CREATE TRIGGER IF NOT EXISTS alarm_fts_ad AFTER DELETE ON alarm BEGIN
+  INSERT INTO alarm_fts(alarm_fts, rowid, url, client_ip, hostname, matched_input) VALUES ('delete', old.rowid, old.url, old.client_ip, old.hostname, old.matched_input);
+END;
+CREATE TRIGGER IF NOT EXISTS alarm_fts_au AFTER UPDATE OF url, client_ip, hostname, matched_input ON alarm BEGIN
+  INSERT INTO alarm_fts(alarm_fts, rowid, url, client_ip, hostname, matched_input) VALUES ('delete', old.rowid, old.url, old.client_ip, old.hostname, old.matched_input);
+  INSERT INTO alarm_fts(rowid, url, client_ip, hostname, matched_input) VALUES (new.rowid, new.url, new.client_ip, new.hostname, new.matched_input);
+END;
+`
+
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // SQLite: serialise writers
-	for _, ddl := range []string{schema, vulnSchema, usersSchema} {
+	for _, ddl := range []string{schema, vulnSchema, usersSchema, ftsSchema} {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("init schema: %w", err)
 		}
@@ -128,6 +146,14 @@ func Open(path string) (*Store, error) {
 	st := &Store{db: db}
 	if err := st.backfillRollup(); err != nil {
 		return nil, fmt.Errorf("alarm rollup migration: %w", err)
+	}
+	if st.GetSetting("alarm_fts_v1", "") != "done" { // index alarms stored before the FTS table existed
+		if _, err := db.Exec(`INSERT INTO alarm_fts(alarm_fts) VALUES('rebuild')`); err != nil {
+			return nil, fmt.Errorf("alarm search index migration: %w", err)
+		}
+		if err := st.SetSetting("alarm_fts_v1", "done"); err != nil {
+			return nil, err
+		}
 	}
 	return st, nil
 }
@@ -617,10 +643,16 @@ func (s *Store) QueryAlarms(q AlarmQuery) ([]*Alarm, int, error) {
 	if q.Since > 0 {
 		where, args = append(where, "a.event_time >= ?"), append(args, q.Since)
 	}
-	if q.Keyword != "" {
-		kw := "%" + q.Keyword + "%"
-		where, args = append(where, "(a.url LIKE ? OR a.client_ip LIKE ? OR a.hostname LIKE ? OR a.matched_input LIKE ?)"),
-			append(args, kw, kw, kw, kw)
+	if kw := strings.TrimSpace(q.Keyword); kw != "" {
+		if utf8.RuneCountInString(kw) >= 3 {
+			// trigram index; the keyword is quoted as one phrase so FTS syntax in user input has no effect
+			where = append(where, "a.rowid IN (SELECT rowid FROM alarm_fts WHERE alarm_fts MATCH ?)")
+			args = append(args, `"`+strings.ReplaceAll(kw, `"`, `""`)+`"`)
+		} else { // trigrams need 3 characters: short keywords scan
+			like := "%" + kw + "%"
+			where, args = append(where, "(a.url LIKE ? OR a.client_ip LIKE ? OR a.hostname LIKE ? OR a.matched_input LIKE ?)"),
+				append(args, like, like, like, like)
+		}
 	}
 	cond := strings.Join(where, " AND ")
 	var total int

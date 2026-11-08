@@ -97,7 +97,6 @@ public final class Reflect {
     }
 
     private static boolean isExported(Class<?> c) {
-        Module m = c.getModule();
-        return !m.isNamed() || m.isExported(c.getPackageName());
+        return Jdk.isExported(c);
     }
 }

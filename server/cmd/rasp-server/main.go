@@ -22,6 +22,7 @@ import (
 	"zhuwei-rasp/server/internal/agentapi"
 	"zhuwei-rasp/server/internal/console"
 	"zhuwei-rasp/server/internal/httpx"
+	"zhuwei-rasp/server/internal/ldapauth"
 	"zhuwei-rasp/server/internal/ops"
 	"zhuwei-rasp/server/internal/signing"
 	"zhuwei-rasp/server/internal/store"
@@ -51,8 +52,27 @@ func main() {
 	tlsKey := flag.String("tls-key", envOr("RASP_TLS_KEY", ""), "TLS key file")
 	opsListen := flag.String("ops-listen", envOr("RASP_OPS_LISTEN", ""), "internal listener for /metrics, /healthz and /readyz (e.g. 127.0.0.1:9480); empty = off")
 	alarmRate := flag.Float64("alarm-rate", envFloat("RASP_ALARM_RATE", 100), "alarm events per second accepted per application (burst 10x); 0 = unlimited")
+	ldapCfg := &ldapauth.Config{}
+	flag.StringVar(&ldapCfg.URL, "ldap-url", envOr("RASP_LDAP_URL", ""), "LDAP/AD server for console login, e.g. ldaps://ldap.corp:636 (empty = local accounts only)")
+	flag.BoolVar(&ldapCfg.StartTLS, "ldap-starttls", envOr("RASP_LDAP_STARTTLS", "") == "true", "upgrade ldap:// connections with StartTLS")
+	flag.StringVar(&ldapCfg.CAFile, "ldap-ca", envOr("RASP_LDAP_CA", ""), "PEM CA bundle for the LDAP server certificate")
+	flag.StringVar(&ldapCfg.BindDN, "ldap-bind-dn", envOr("RASP_LDAP_BIND_DN", ""), "service account DN for user lookups (password from RASP_LDAP_BIND_PASSWORD)")
+	flag.StringVar(&ldapCfg.BaseDN, "ldap-base-dn", envOr("RASP_LDAP_BASE_DN", ""), "base DN of user entries")
+	flag.StringVar(&ldapCfg.UserAttr, "ldap-user-attr", envOr("RASP_LDAP_USER_ATTR", "uid"), "login name attribute (uid; sAMAccountName for AD)")
+	flag.StringVar(&ldapCfg.AdminGroup, "ldap-admin-group", envOr("RASP_LDAP_ADMIN_GROUP", ""), "group DN mapped to the admin role")
+	flag.StringVar(&ldapCfg.OperatorGroup, "ldap-operator-group", envOr("RASP_LDAP_OPERATOR_GROUP", ""), "group DN mapped to the operator role")
+	flag.StringVar(&ldapCfg.ViewerGroup, "ldap-viewer-group", envOr("RASP_LDAP_VIEWER_GROUP", ""), "group DN mapped to the viewer role")
+	osvURL := flag.String("osv-url", envOr("RASP_OSV_URL", ""), "download OSV advisories from this URL periodically, e.g. https://osv-vulnerabilities.storage.googleapis.com/Maven/all.zip (empty = off; import offline with `rasp-server import-osv`)")
+	osvEvery := flag.Duration("osv-interval", 24*time.Hour, "interval for -osv-url updates")
 	signKey := flag.String("sign-key", envOr("RASP_SIGN_KEY", ""), "policy signing key (PKCS#8 PEM, ECDSA P-256; default <db dir>/rasp-sign.key, created if missing)")
 	flag.Parse()
+	ldapCfg.BindPassword = os.Getenv("RASP_LDAP_BIND_PASSWORD") // never a flag: it would show in ps
+	if ldapCfg.Enabled() {
+		if err := ldapCfg.Validate(); err != nil {
+			log.Fatalf("ldap: %v", err)
+		}
+		log.Printf("console login: local accounts, then LDAP %s (users looked up by %s under %s)", ldapCfg.URL, ldapCfg.UserAttr, ldapCfg.BaseDN)
+	}
 	if *signKey == "" {
 		*signKey = filepath.Join(filepath.Dir(*dbPath), "rasp-sign.key")
 	}
@@ -92,9 +112,26 @@ func main() {
 	agents.Register(mux)
 	consoleAPI := console.New(st, *agentURL, signer)
 	consoleAPI.Vulns = vulns
+	if ldapCfg.Enabled() {
+		consoleAPI.LDAP = ldapCfg
+	}
 	consoleAPI.Register(mux)
 	vulns.Trigger() // match components already in the database against the current advisories
-	for _, w := range configWarnings(*listen, *tlsCert, *agentURL, *opsListen, st.GetSetting("notify_webhook", "")) {
+	if *osvURL != "" {
+		if !strings.HasPrefix(*osvURL, "https://") {
+			log.Fatalf("-osv-url must use https://")
+		}
+		if *osvEvery < time.Hour {
+			*osvEvery = time.Hour
+		}
+		log.Printf("vulnerability data: automatic update from %s every %s", *osvURL, *osvEvery)
+		vulns.StartAutoUpdate(*osvURL, *osvEvery, func(detail string) { st.AddAudit("system", "import_vulns", *osvURL, detail) })
+	}
+	warnings := configWarnings(*listen, *tlsCert, *agentURL, *opsListen, st.GetSetting("notify_webhook", ""))
+	if ldapCfg.Enabled() && !ldapCfg.Encrypted() {
+		warnings = append(warnings, "LDAP connection is not encrypted (use ldaps:// or -ldap-starttls): user passwords would be sent in clear text")
+	}
+	for _, w := range warnings {
 		log.Printf("CONFIG WARNING: %s", w)
 	}
 	ready := func() error { return st.Ping() }

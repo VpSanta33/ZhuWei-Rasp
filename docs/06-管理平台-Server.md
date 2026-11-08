@@ -197,12 +197,20 @@ Agent 拿到的最终配置 = 默认策略 ⊕ 应用绑定的策略 ⊕ 应用�
 - 登录失败按 IP 和用户名分别计数，15 分钟内 10 次即锁定 15 分钟，并写入审计（`login_failed`）。
 - 接口：`/api/v1/me`、`PUT /api/v1/me/password`、`/api/v1/tokens`、`/api/v1/users`（admin）。命令行：`rasp-server user list|add|passwd|role|disable|enable`（口令从 `RASP_NEW_PASSWORD` 或标准输入读取）。
 
+**LDAP / Active Directory 登录（MVP 已实现）**：
+
+- 登录顺序：先校验本地账号；只有在没有同名本地账号时才查询目录，目录中的同名条目不能接管本地账号（内置管理员在目录故障时仍可登录）。
+- 流程：服务账号绑定 → 按 `-ldap-user-attr`（OpenLDAP 用 `uid`，AD 用 `sAMAccountName`）查找唯一用户（输入经过过滤器转义）→ 以用户 DN 和口令绑定校验（拒绝空口令，防止匿名绑定）→ 按 `memberOf` 映射角色，取最高者；未映射到任何角色的用户拒绝登录。
+- 首次登录自动建立本地记录（`source=ldap`），之后每次登录按目录同步角色；管理员可在平台禁用该用户（立即注销会话），其口令不能在平台修改。
+- 目录不可用时返回 503，不计入登录失败锁定；`ldap://` 未启用 StartTLS 时启动告警（口令明文传输）。
+- 配置：`-ldap-url`、`-ldap-starttls`、`-ldap-ca`、`-ldap-bind-dn`、`-ldap-base-dn`、`-ldap-user-attr`、`-ldap-admin-group`、`-ldap-operator-group`、`-ldap-viewer-group`；服务账号口令只从环境变量 `RASP_LDAP_BIND_PASSWORD` 读取。
+
 目标形态（未实现）：
 
 - RBAC：内置 超级管理员 / 安全管理员 / 安全运营 / 只读 / 开发（只能看自己负责的应用）。
 - 数据权限：按部门 + 应用负责人隔离。
 - 关键操作（切换阻断模式、全局开关、发布规则、加白）需要记录审计日志，可配置二次确认。
-- SSO：LDAP、OIDC（对接公司统一认证）。
+- SSO：OIDC（对接公司统一认证）；LDAP 已实现，见上。
 
 ## 6.7 API 规范
 

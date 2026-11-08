@@ -406,7 +406,7 @@ public final class RequestContext {
 
     private static String decode(String s) {
         try {
-            return URLDecoder.decode(s, StandardCharsets.UTF_8);
+            return urlDecode(s);
         } catch (IllegalArgumentException e) {
             return s;
         }
@@ -414,5 +414,14 @@ public final class RequestContext {
 
     private static String str(Object o) {
         return o == null ? "" : o.toString();
+    }
+
+    /** URLDecoder.decode(String, Charset) is JDK 10+; the charset-name overload exists since 1.4. */
+    private static String urlDecode(String s) {
+        try {
+            return URLDecoder.decode(s, "UTF-8");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return s; // UTF-8 is always supported
+        }
     }
 }

@@ -83,6 +83,15 @@ final class JarLocation {
     }
 
     private static String decode(String s) {
-        return URLDecoder.decode(s.replace("+", "%2B"), StandardCharsets.UTF_8);
+        return urlDecode(s.replace("+", "%2B"));
+    }
+
+    /** URLDecoder.decode(String, Charset) is JDK 10+; the charset-name overload exists since 1.4. */
+    private static String urlDecode(String s) {
+        try {
+            return URLDecoder.decode(s, "UTF-8");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return s; // UTF-8 is always supported
+        }
     }
 }

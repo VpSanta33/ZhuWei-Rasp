@@ -119,7 +119,7 @@ public final class ClassHierarchy {
             InputStream src = in;
             if (src == null && loader == null) {
                 // platform/boot module classes
-                src = ClassLoader.getPlatformClassLoader().getResourceAsStream(res);
+                src = com.zhuwei.rasp.core.util.Jdk.platformClassLoader().getResourceAsStream(res);
             }
             if (src == null) {
                 return UNKNOWN;

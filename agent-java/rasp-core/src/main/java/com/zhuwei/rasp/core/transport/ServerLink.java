@@ -127,7 +127,7 @@ public final class ServerLink {
         b.put("env", env);
         b.put("hostname", hostname());
         b.put("ips", ips());
-        b.put("pid", ProcessHandle.current().pid());
+        b.put("pid", com.zhuwei.rasp.core.util.Jdk.pid());
         b.put("os", System.getProperty("os.name") + " " + System.getProperty("os.version") + " " + System.getProperty("os.arch"));
         Map<String, Object> rt = new LinkedHashMap<>();
         rt.put("name", System.getProperty("java.vm.vendor"));

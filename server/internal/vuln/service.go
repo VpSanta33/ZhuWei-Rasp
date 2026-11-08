@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -357,4 +358,65 @@ func toRow(a *Advisory) *store.VulnRow {
 		row.Affected = append(row.Affected, &store.AffectedRow{Package: m.Package, Ranges: string(ranges), Versions: string(versions)})
 	}
 	return row
+}
+
+// maxDownloadBytes bounds an automatic OSV download (the Maven export is ~10 MB compressed).
+const maxDownloadBytes = 512 << 20
+
+// StartAutoUpdate downloads an OSV export from url every interval (first run after a short delay) and
+// imports it. Off unless configured: the platform otherwise never initiates outbound connections.
+// HTTP(S)_PROXY environment variables are honoured.
+func (s *Service) StartAutoUpdate(url string, every time.Duration, audit func(detail string)) {
+	go func() {
+		time.Sleep(time.Minute)
+		for {
+			res, err := s.UpdateFrom(url)
+			if err != nil {
+				log.Printf("vulnerability data update from %s failed: %v", url, err)
+			} else {
+				log.Printf("vulnerability data updated from %s: %d documents, %d inserted, %d updated, %d withdrawn; %d findings (%d new)",
+					url, res.Files, res.Store.Inserted, res.Store.Updated, res.Store.Withdrawn, res.Match.Findings, res.Match.NewFindings)
+				if audit != nil {
+					audit(fmt.Sprintf("documents=%d inserted=%d updated=%d withdrawn=%d findings=%d new=%d",
+						res.Files, res.Store.Inserted, res.Store.Updated, res.Store.Withdrawn, res.Match.Findings, res.Match.NewFindings))
+				}
+			}
+			time.Sleep(every)
+		}
+	}()
+}
+
+// UpdateFrom downloads one OSV export (zip) and imports it.
+func (s *Service) UpdateFrom(url string) (*ImportResult, error) {
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	tmp, err := os.CreateTemp("", "rasp-osv-download-*.zip")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	n, err := io.Copy(tmp, io.LimitReader(resp.Body, maxDownloadBytes+1))
+	tmp.Close()
+	if err != nil {
+		return nil, err
+	}
+	if n > maxDownloadBytes {
+		return nil, fmt.Errorf("download larger than %d MiB", maxDownloadBytes>>20)
+	}
+	if !isZip(tmp.Name()) {
+		return nil, fmt.Errorf("downloaded file is not a zip archive")
+	}
+	res, err := s.ImportPath(tmp.Name())
+	if err != nil {
+		return nil, err
+	}
+	res.Source = url
+	return res, nil
 }

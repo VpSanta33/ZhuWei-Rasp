@@ -3,6 +3,7 @@ package com.zhuwei.rasp.core.transform;
 import com.zhuwei.rasp.core.hook.HookPoint;
 import com.zhuwei.rasp.core.hook.HookRegistry;
 import com.zhuwei.rasp.core.util.Guard;
+import com.zhuwei.rasp.core.util.Jdk;
 import com.zhuwei.rasp.core.util.RaspLog;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
@@ -36,7 +37,8 @@ public final class RaspTransformer implements ClassFileTransformer {
 
     private final Instrumentation inst;
     private final ClassHierarchy hierarchy = new ClassHierarchy();
-    private final Module spyModule;
+    /** java.lang.Module holding Spy on JDK 9+, null on JDK 8 (kept as Object to compile for Java 8). */
+    private final Object spyModule;
     private final ClassLoader raspLoader = RaspTransformer.class.getClassLoader();
     /** Names of classes we have instrumented, used for uninstall and diagnostics. */
     private final Set<String> transformed = ConcurrentHashMap.newKeySet();
@@ -44,7 +46,7 @@ public final class RaspTransformer implements ClassFileTransformer {
     private final File dumpDir;
     private volatile boolean enabled = true;
 
-    public RaspTransformer(Instrumentation inst, Module spyModule, File dumpDir) {
+    public RaspTransformer(Instrumentation inst, Object spyModule, File dumpDir) {
         this.inst = inst;
         this.spyModule = spyModule;
         this.dumpDir = dumpDir;
@@ -84,9 +86,15 @@ public final class RaspTransformer implements ClassFileTransformer {
         return Collections.unmodifiableSet(transformed);
     }
 
+    /**
+     * The Java 8 signature; on JDK 9+ the default {@code transform(Module, ...)} delegates here. Named JDK
+     * modules are made to read Spy at startup (Jdk.allowBootModulesToRead); for retransformed classes the
+     * module is also checked here.
+     */
     @Override
-    public byte[] transform(Module module, ClassLoader loader, String className, Class<?> redefined,
+    public byte[] transform(ClassLoader loader, String className, Class<?> redefined,
                             ProtectionDomain pd, byte[] bytes) {
+        Object module = Jdk.moduleOf(redefined);
         if (!enabled || className == null || loader == raspLoader) {
             return null;
         }
@@ -212,10 +220,11 @@ public final class RaspTransformer implements ClassFileTransformer {
     }
 
     /** Named modules (e.g. java.base) must be allowed to read the bootstrap unnamed module holding Spy. */
-    private void ensureReadsSpy(Module module) {
-        if (module != null && module.isNamed() && !module.canRead(spyModule)) {
-            inst.redefineModule(module, Collections.singleton(spyModule), Collections.emptyMap(),
-                    Collections.emptyMap(), Collections.emptySet(), Collections.emptyMap());
+    private void ensureReadsSpy(Object module) {
+        try {
+            Jdk.ensureReads(inst, module, spyModule);
+        } catch (Exception e) {
+            RaspLog.debug("cannot open module to Spy: " + e);
         }
     }
 

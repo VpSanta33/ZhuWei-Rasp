@@ -12,6 +12,7 @@ import (
 
 	"zhuwei-rasp/server/internal/agentapi"
 	"zhuwei-rasp/server/internal/httpx"
+	"zhuwei-rasp/server/internal/ldapauth"
 	"zhuwei-rasp/server/internal/policy"
 	"zhuwei-rasp/server/internal/signing"
 	"zhuwei-rasp/server/internal/store"
@@ -31,6 +32,8 @@ type API struct {
 	Vulns *vuln.Service
 
 	limit *limiter
+	// LDAP, when enabled, authenticates names that are not local accounts (set by main).
+	LDAP *ldapauth.Config
 }
 
 // New creates the console API. agentURL is the address agents should use (shown in install snippets).

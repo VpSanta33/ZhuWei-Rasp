@@ -14,10 +14,13 @@
         <module>rasp-core</module>
         <module>rasp-launcher</module>
         <module>demo-app</module>
+        <module>compat-app</module>
     </modules>
 
     <properties>
-        <maven.compiler.release>11</maven.compiler.release>
+        <!-- the agent runs inside JDK 8+ applications; tests run on the build JDK and may use newer APIs -->
+        <maven.compiler.release>8</maven.compiler.release>
+        <maven.compiler.testRelease>11</maven.compiler.testRelease>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <asm.version>9.11.1</asm.version>
         <junit.version>5.11.4</junit.version>

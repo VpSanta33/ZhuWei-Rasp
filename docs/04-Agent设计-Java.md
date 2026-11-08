@@ -299,3 +299,11 @@ MVP 另有 `sca.enabled`（默认 true）、`sca.initial_delay_sec`（默认 30�
 - 日志同样不能写满磁盘：总大小受限。
 
 下一章：[检测引擎与规则](05-检测引擎与规则.md)
+
+## 附：JDK 8 兼容（MVP 已实现）
+
+- Agent 三个 jar 以 Java 8 字节码（major 52）编译（`maven.compiler.release=8`；测试代码用 11）。
+- 模块系统 API（`Module`、`Instrumentation.redefineModule`、`getPlatformClassLoader`）集中在 `util/Jdk`，通过反射调用，JDK 8 上为空操作；`ProcessHandle` 改用 RuntimeMXBean 取 pid。
+- `RaspTransformer` 实现 Java 8 的 5 参数 `transform`；JDK 9+ 上默认的 `transform(Module, …)` 委托给它，命名模块在启动时统一打开对 Spy 的读权限。
+- attach 工具通过反射使用 `com.sun.tools.attach`：JDK 9+ 来自 `jdk.attach` 模块，JDK 8 自动加载 `$JAVA_HOME/lib/tools.jar`（`java -jar` 无法追加 classpath）。
+- 兼容性测试：`agent-java/compat-app`（Java 8 + Tomcat 9 / javax.servlet）+ `smoke-test.sh`，CI 在 JDK 8、11、17、21 上运行：启动注入、javax.servlet Hook、请求线程/线程池/CompletableFuture 告警、命令执行 Hook、动态 attach/detach。

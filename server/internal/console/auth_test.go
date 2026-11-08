@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"zhuwei-rasp/server/internal/ldapauth"
+	"zhuwei-rasp/server/internal/ldapauth/ldaptest"
 	"zhuwei-rasp/server/internal/signing"
 	"zhuwei-rasp/server/internal/store"
 )
@@ -36,7 +38,15 @@ func setup(t *testing.T) *env {
 		}
 	}
 	mux := http.NewServeMux()
-	New(st, "http://agent", signer).Register(mux)
+	api := New(st, "http://agent", signer)
+	directory := &ldaptest.Server{ServiceDN: "cn=svc,dc=corp", ServicePassword: "svc-secret", Users: []ldaptest.User{
+		{UID: "lena", DN: "uid=lena,dc=corp", Password: "lena-ldap-pass", Groups: []string{"cn=ops,dc=corp"}},
+		{UID: "root", DN: "uid=root,dc=corp", Password: "ldap-root-pass", Groups: []string{"cn=admins,dc=corp"}},
+		{UID: "otto", DN: "uid=otto,dc=corp", Password: "otto-ldap-pass", Groups: []string{"cn=finance,dc=corp"}},
+	}}
+	api.LDAP = &ldapauth.Config{URL: directory.Start(t), BindDN: directory.ServiceDN, BindPassword: directory.ServicePassword, BaseDN: "dc=corp",
+		UserAttr: "uid", AdminGroup: "cn=admins,dc=corp", OperatorGroup: "cn=ops,dc=corp"}
+	api.Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(func() { srv.Close(); st.Close() })
 	return &env{t, st, srv}
@@ -253,5 +263,54 @@ func TestPasswordHashing(t *testing.T) {
 	h2, _ := store.HashPassword("correct horse battery")
 	if h == h2 {
 		t.Fatal("hashes must be salted")
+	}
+}
+
+func TestLDAPLogin(t *testing.T) {
+	e := setup(t)
+	code, out := e.do("POST", "/api/v1/login", "", map[string]string{"username": "lena", "password": "lena-ldap-pass"})
+	if code != 200 || out["data"].(map[string]any)["role"] != "operator" {
+		t.Fatalf("ldap login = %d %v", code, out)
+	}
+	lena := out["data"].(map[string]any)["token"].(string)
+	if c, _ := e.do("POST", "/api/v1/apps", lena, map[string]string{"name": "via-ldap"}); c != 200 {
+		t.Fatalf("ldap operator write = %d", c)
+	}
+	// account recorded as an LDAP user; its password cannot be managed locally
+	root := e.login("root")
+	_, out = e.do("GET", "/api/v1/users", root, nil)
+	found := false
+	for _, u := range out["data"].([]any) {
+		m := u.(map[string]any)
+		if m["username"] == "lena" && m["role"] == "operator" && m["source"] == "ldap" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ldap user not recorded: %v", out)
+	}
+	if c, _ := e.do("PUT", "/api/v1/users/lena", root, map[string]string{"password": "a-new-long-password"}); c != 409 {
+		t.Fatalf("set password of ldap user = %d", c)
+	}
+	// a local account always wins: the directory's "root" entry cannot log in as the local admin
+	if c, _ := e.do("POST", "/api/v1/login", "", map[string]string{"username": "root", "password": "ldap-root-pass"}); c != 401 {
+		t.Fatalf("ldap took over local account = %d", c)
+	}
+	// directory users without a mapped group, and locally disabled ldap users, are refused
+	if c, _ := e.do("POST", "/api/v1/login", "", map[string]string{"username": "otto", "password": "otto-ldap-pass"}); c != 401 {
+		t.Fatalf("unmapped ldap user = %d", c)
+	}
+	if c, _ := e.do("PUT", "/api/v1/users/lena", root, map[string]any{"disabled": true}); c != 200 {
+		t.Fatalf("disable ldap user = %d", c)
+	}
+	if c, _ := e.do("GET", "/api/v1/me", lena, nil); c != 401 {
+		t.Fatalf("disabled ldap user's session = %d", c)
+	}
+	if c, _ := e.do("POST", "/api/v1/login", "", map[string]string{"username": "lena", "password": "lena-ldap-pass"}); c != 401 {
+		t.Fatalf("disabled ldap login = %d", c)
+	}
+	audit, _ := e.st.ListAudit(50)
+	if !strings.Contains(mustJSON(audit), "ldap: no mapped group") {
+		t.Fatalf("audit lacks ldap failure detail")
 	}
 }

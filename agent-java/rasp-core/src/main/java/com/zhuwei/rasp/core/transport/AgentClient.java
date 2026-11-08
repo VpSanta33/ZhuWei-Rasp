@@ -115,7 +115,7 @@ public final class AgentClient {
             while ((n = s.read(buf)) > 0) {
                 bo.write(buf, 0, n);
             }
-            return bo.toString(StandardCharsets.UTF_8);
+            return new String(bo.toByteArray(), StandardCharsets.UTF_8);
         }
     }
 }

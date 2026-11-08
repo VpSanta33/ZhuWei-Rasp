@@ -2,6 +2,8 @@ package vuln
 
 import (
 	"archive/zip"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,5 +137,38 @@ func TestImportMatchNotifyAndUpdate(t *testing.T) {
 	res, _ = svc.ImportPath(export)
 	if res.Store.Unchanged != 2 || res.Store.Inserted != 1 { // log4j unchanged, jackson older, low re-inserted
 		t.Fatalf("re-import = %+v", res.Store)
+	}
+}
+
+func TestUpdateFromURL(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "u.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	export := filepath.Join(dir, "osv.zip")
+	writeZip(t, export, map[string]string{"a.json": sampleOSV})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/all.zip":
+			http.ServeFile(w, r, export)
+		case "/html":
+			_, _ = w.Write([]byte("<html>captive portal</html>"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	svc := &Service{st: st, dirty: make(chan struct{}, 1)}
+	res, err := svc.UpdateFrom(srv.URL + "/all.zip")
+	if err != nil || res.Store.Inserted != 1 || res.Source != srv.URL+"/all.zip" {
+		t.Fatalf("update = %+v %v", res, err)
+	}
+	if _, err := svc.UpdateFrom(srv.URL + "/html"); err == nil || !strings.Contains(err.Error(), "not a zip") {
+		t.Fatalf("non-zip download accepted: %v", err)
+	}
+	if _, err := svc.UpdateFrom(srv.URL + "/missing"); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("404 accepted: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"zhuwei-rasp/server/internal/httpx"
+	"zhuwei-rasp/server/internal/ldapauth"
 	"zhuwei-rasp/server/internal/ops"
 	"zhuwei-rasp/server/internal/store"
 )
@@ -153,10 +155,33 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := a.st.Authenticate(req.Username, req.Password)
+	source := "local"
+	if errors.Is(err, store.ErrNotFound) && a.LDAP.Enabled() && !a.st.IsLocalUser(req.Username) {
+		// Local accounts win: the directory is only asked about names that have no local password.
+		source = "ldap"
+		var role string
+		role, err = a.LDAP.Authenticate(req.Username, req.Password)
+		switch {
+		case err == nil:
+			u, err = a.st.UpsertExternalUser(req.Username, role, "ldap")
+		case errors.Is(err, ldapauth.ErrInvalidCredentials), errors.Is(err, ldapauth.ErrNoRole):
+			// counted as a failed login below
+		default:
+			log.Printf("ldap login for %q: %v", req.Username, err)
+			httpx.Fail(w, http.StatusServiceUnavailable, "directory service unavailable, try again later")
+			return
+		}
+	}
 	if err != nil {
 		a.limit.fail(keys...)
 		ops.LoginFailures.Inc("")
-		a.st.AddAudit(req.Username, "login_failed", ip, "")
+		detail := source
+		if errors.Is(err, ldapauth.ErrNoRole) {
+			detail = "ldap: no mapped group"
+		} else if errors.Is(err, store.ErrDisabled) || errors.Is(err, store.ErrLocalAccount) {
+			detail = source + ": " + err.Error()
+		}
+		a.st.AddAudit(req.Username, "login_failed", ip, detail)
 		time.Sleep(300 * time.Millisecond)
 		httpx.Fail(w, http.StatusUnauthorized, "wrong username or password")
 		return
@@ -167,7 +192,7 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.limit.reset(keys...)
-	a.st.AddAudit(u.Username, "login", ip, "")
+	a.st.AddAudit(u.Username, "login", ip, source)
 	httpx.OK(w, map[string]string{"token": tok, "user": u.Username, "role": u.Role})
 }
 
@@ -212,7 +237,7 @@ func userErr(w http.ResponseWriter, err error) {
 		httpx.Fail(w, http.StatusNotFound, "not found")
 	case errors.Is(err, store.ErrConflict):
 		httpx.Fail(w, http.StatusConflict, "user already exists")
-	case errors.Is(err, store.ErrLastAdmin):
+	case errors.Is(err, store.ErrLastAdmin), errors.Is(err, store.ErrExternal):
 		httpx.Fail(w, http.StatusConflict, err.Error())
 	default:
 		httpx.Fail(w, http.StatusBadRequest, err.Error())

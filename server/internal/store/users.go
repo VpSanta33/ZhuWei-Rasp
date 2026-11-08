@@ -66,6 +66,7 @@ func RoleRank(role string) int {
 type User struct {
 	Username  string `json:"username"`
 	Role      string `json:"role"`
+	Source    string `json:"source"` // "local", or the directory for externally authenticated users ("ldap")
 	Disabled  bool   `json:"disabled"`
 	CreatedAt int64  `json:"created_at"`
 	UpdatedAt int64  `json:"updated_at"`
@@ -159,7 +160,61 @@ func scanUser(r interface{ Scan(...any) error }) (*User, error) {
 		return nil, ErrNotFound
 	}
 	u.Disabled = disabled != 0
+	u.Source = "local"
+	if strings.HasPrefix(u.pwHash, externalPrefix) {
+		u.Source = strings.TrimPrefix(u.pwHash, externalPrefix)
+	}
 	return u, err
+}
+
+// externalPrefix marks users whose password is checked by a directory (pw_hash "external:ldap").
+const externalPrefix = "external:"
+
+var (
+	ErrLocalAccount = errors.New("a local account with this name exists")
+	ErrDisabled     = errors.New("account disabled")
+	ErrExternal     = errors.New("password is managed by the directory")
+)
+
+// IsLocalUser reports whether a password-based local account with this name exists.
+func (s *Store) IsLocalUser(username string) bool {
+	u, err := s.GetUser(username)
+	return err == nil && u.Source == "local"
+}
+
+// UpsertExternalUser records a directory-authenticated login: creates the user on first login, re-syncs
+// the role from the directory afterwards (unless that would remove the last enabled admin) and refuses
+// users an administrator disabled locally.
+func (s *Store) UpsertExternalUser(username, role, source string) (*User, error) {
+	if RoleRank(role) == 0 {
+		return nil, fmt.Errorf("invalid role %q", role)
+	}
+	u, err := s.GetUser(username)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		if !validUsername(username) {
+			return nil, fmt.Errorf("directory user name %q is not a valid console user name", username)
+		}
+		ts := now()
+		if _, err := s.db.Exec(`INSERT INTO console_user(username, role, pw_hash, created_at, updated_at, last_login) VALUES(?,?,?,?,?,?)`,
+			username, role, externalPrefix+source, ts, ts, ts); err != nil {
+			return nil, err
+		}
+		return s.GetUser(username)
+	case err != nil:
+		return nil, err
+	case u.Source == "local":
+		return nil, ErrLocalAccount
+	case u.Disabled:
+		return nil, ErrDisabled
+	}
+	if u.Role != role {
+		if err := s.UpdateUser(username, &role, nil, nil); err != nil && !errors.Is(err, ErrLastAdmin) {
+			return nil, err
+		}
+	}
+	_, _ = s.db.Exec(`UPDATE console_user SET last_login = ? WHERE username = ?`, now(), username)
+	return s.GetUser(username)
 }
 
 func (s *Store) GetUser(username string) (*User, error) {
@@ -245,6 +300,9 @@ func (s *Store) UpdateUser(username string, role *string, disabled *bool, passwo
 		sets, args = append(sets, "disabled = ?"), append(args, d)
 	}
 	if password != nil {
+		if u.Source != "local" {
+			return ErrExternal
+		}
 		if err := ValidatePassword(*password); err != nil {
 			return err
 		}

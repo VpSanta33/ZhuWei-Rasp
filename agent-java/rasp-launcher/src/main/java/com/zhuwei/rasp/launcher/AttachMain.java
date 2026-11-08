@@ -1,10 +1,5 @@
 package com.zhuwei.rasp.launcher;
 
-import com.sun.tools.attach.AgentLoadException;
-import com.sun.tools.attach.AttachNotSupportedException;
-import com.sun.tools.attach.VirtualMachine;
-import com.sun.tools.attach.VirtualMachineDescriptor;
-
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -21,13 +16,13 @@ import java.util.Properties;
  * java -jar rasp-launcher.jar detach &lt;pid&gt;
  * </pre>
  *
- * Must run as the same OS user as the target JVM, with a full JDK (module jdk.attach).
+ * Must run as the same OS user as the target JVM, with a full JDK (jdk.attach module on 9+, lib/tools.jar on 8).
  * This class is only used in the tool process; it is never loaded inside the target JVM.
  */
 public final class AttachMain {
 
     private static final String LOADED_FLAG = "zhuwei.rasp.loaded";
-    private static final int MIN_JAVA = 11;
+    private static final int MIN_JAVA = 8;
 
     private AttachMain() { }
 
@@ -35,9 +30,9 @@ public final class AttachMain {
         int code;
         try {
             code = run(args);
-        } catch (NoClassDefFoundError e) {
-            System.err.println("错误：当前 Java 不包含 jdk.attach 模块（可能是 JRE）。请使用完整 JDK 运行本工具，"
-                    + "最好与目标进程使用同一个 JDK。");
+        } catch (NoClassDefFoundError | AttachToolMissing e) {
+            System.err.println("错误：当前 Java 不包含 attach 工具（JDK 9+ 的 jdk.attach 模块，或 JDK 8 的 lib/tools.jar），可能是 JRE。"
+                    + "请使用完整 JDK 运行本工具，最好与目标进程使用同一个 JDK。");
             code = 3;
         }
         System.exit(code);
@@ -63,6 +58,13 @@ public final class AttachMain {
         }
     }
 
+    /** Thrown when neither jdk.attach nor tools.jar is available. */
+    static final class AttachToolMissing extends RuntimeException {
+        AttachToolMissing(Throwable cause) {
+            super(cause);
+        }
+    }
+
     interface PidCommand {
         int run(String pid) throws Exception;
     }
@@ -74,21 +76,27 @@ public final class AttachMain {
             return 2;
         }
         String pid = args[1];
-        if (pid.equals(String.valueOf(ProcessHandle.current().pid()))) {
+        if (pid.equals(selfPid())) {
             System.err.println("不能对工具自身进程操作");
             return 2;
         }
         try {
             return cmd.run(pid);
-        } catch (AttachNotSupportedException e) {
-            System.err.println("无法连接进程 " + pid + "：" + e.getMessage());
-            System.err.println("请确认：进程存在且是 HotSpot/OpenJ9 JVM；本工具与目标进程是同一个系统用户；"
-                    + "目标进程未使用 -XX:+DisableAttachMechanism。");
+        } catch (AttachApi.AttachException e) {
+            if (e.getCause() instanceof ClassNotFoundException) {
+                throw new AttachToolMissing(e);
+            }
+            if ("AgentLoadException".equals(e.kind) || "AgentInitializationException".equals(e.kind)) {
+                System.err.println("Agent 加载失败：" + e.getMessage());
+                System.err.println("如果目标使用了 -XX:-EnableDynamicAgentLoading，需要改为启动参数方式（-javaagent）接入。");
+            } else {
+                System.err.println("无法连接进程 " + pid + "：" + e.getMessage());
+                System.err.println("请确认：进程存在且是 HotSpot/OpenJ9 JVM；本工具与目标进程是同一个系统用户；"
+                        + "目标进程未使用 -XX:+DisableAttachMechanism。");
+            }
             return 1;
-        } catch (AgentLoadException e) {
-            System.err.println("Agent 加载失败：" + e.getMessage());
-            System.err.println("如果目标使用了 -XX:-EnableDynamicAgentLoading，需要改为启动参数方式（-javaagent）接入。");
-            return 1;
+        } catch (ClassNotFoundException e) {
+            throw new AttachToolMissing(e);
         } catch (Exception e) {
             System.err.println("操作失败：" + e);
             return 1;
@@ -98,31 +106,37 @@ public final class AttachMain {
     // ------------------------------------------------------------------ commands
 
     private static int list() {
-        String self = String.valueOf(ProcessHandle.current().pid());
+        String self = selfPid();
         System.out.printf("%-8s %s%n", "PID", "MAIN CLASS / JAR");
-        for (VirtualMachineDescriptor d : VirtualMachine.list()) {
-            if (d.id().equals(self)) {
+        List<String[]> vms;
+        try {
+            vms = AttachApi.list();
+        } catch (ClassNotFoundException e) {
+            throw new AttachToolMissing(e);
+        } catch (Exception e) {
+            System.err.println("无法列出 Java 进程：" + e);
+            return 1;
+        }
+        for (String[] d : vms) {
+            if (d[0].equals(self)) {
                 continue;
             }
-            String name = d.displayName().isEmpty() ? "(unknown)" : d.displayName();
-            System.out.printf("%-8s %s%n", d.id(), name.length() > 120 ? name.substring(0, 120) + "..." : name);
+            String name = d[1].isEmpty() ? "(unknown)" : d[1];
+            System.out.printf("%-8s %s%n", d[0], name.length() > 120 ? name.substring(0, 120) + "..." : name);
         }
         System.out.println("查看某个进程是否已注入：status <pid>");
         return 0;
     }
 
     private static int status(String pid) throws Exception {
-        VirtualMachine vm = VirtualMachine.attach(pid);
-        try {
-            Properties p = vm.getSystemProperties();
+        try (AttachApi.Vm vm = new AttachApi.Vm(pid)) {
+            Properties p = vm.systemProperties();
             System.out.println("pid:           " + pid);
             System.out.println("java.version:  " + p.getProperty("java.version"));
             System.out.println("java.vm.name:  " + p.getProperty("java.vm.name"));
             System.out.println("user.name:     " + p.getProperty("user.name"));
             System.out.println("RASP loaded:   " + (p.getProperty(LOADED_FLAG) != null ? "yes" : "no"));
             return 0;
-        } finally {
-            vm.detach();
         }
     }
 
@@ -133,9 +147,8 @@ public final class AttachMain {
             System.err.println("安装目录不完整：" + home + " 下缺少 rasp-core.jar 或 rasp-bootstrap.jar");
             return 1;
         }
-        VirtualMachine vm = VirtualMachine.attach(pid);
-        try {
-            Properties p = vm.getSystemProperties();
+        try (AttachApi.Vm vm = new AttachApi.Vm(pid)) {
+            Properties p = vm.systemProperties();
             if (p.getProperty(LOADED_FLAG) != null) {
                 System.out.println("进程 " + pid + " 已经加载了 RASP，无需重复注入（如需升级，请先 detach）");
                 return 0;
@@ -151,33 +164,28 @@ public final class AttachMain {
             System.out.println("正在注入 " + pid + "（" + p.getProperty("java.version") + "），安装目录 " + home + " ...");
             vm.loadAgent(jar, agentArgs);
             // agentmain runs synchronously; the launcher sets the flag only when the core started
-            if (vm.getSystemProperties().getProperty(LOADED_FLAG) != null) {
+            if (vm.systemProperties().getProperty(LOADED_FLAG) != null) {
                 System.out.println("注入成功。日志：" + new File(home, "logs/rasp.log"));
                 return 0;
             }
             System.err.println("Agent 已加载但核心未启动，请查看目标进程的标准错误输出和 " + new File(home, "logs/rasp.log"));
             return 1;
-        } finally {
-            vm.detach();
         }
     }
 
     private static int detach(String pid) throws Exception {
-        VirtualMachine vm = VirtualMachine.attach(pid);
-        try {
-            if (vm.getSystemProperties().getProperty(LOADED_FLAG) == null) {
+        try (AttachApi.Vm vm = new AttachApi.Vm(pid)) {
+            if (vm.systemProperties().getProperty(LOADED_FLAG) == null) {
                 System.out.println("进程 " + pid + " 未加载 RASP");
                 return 0;
             }
             vm.loadAgent(selfJar(), "uninstall");
-            if (vm.getSystemProperties().getProperty(LOADED_FLAG) == null) {
+            if (vm.systemProperties().getProperty(LOADED_FLAG) == null) {
                 System.out.println("已卸载：检测已停止，被增强的类已恢复为原始字节码。");
                 return 0;
             }
             System.err.println("卸载可能未完成，请查看目标进程日志");
             return 1;
-        } finally {
-            vm.detach();
         }
     }
 
@@ -211,6 +219,13 @@ public final class AttachMain {
         } catch (NumberFormatException e) {
             return 0;
         }
+    }
+
+    /** Own pid without ProcessHandle (JDK 9+): RuntimeMXBean name is "pid@host" on HotSpot/OpenJ9. */
+    static String selfPid() {
+        String name = java.lang.management.ManagementFactory.getRuntimeMXBean().getName();
+        int at = name.indexOf('@');
+        return at > 0 ? name.substring(0, at) : name;
     }
 
     private static String selfJar() throws Exception {
