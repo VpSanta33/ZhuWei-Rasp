@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Removes the ZhuWei-RASP Java agent.
 #
-#   tools/uninstall.sh [--prefix /opt/rasp] [--tomcat CATALINA_BASE] [--purge] [--force]
+#   tools/uninstall.sh [--prefix /opt/rasp] [--tomcat CATALINA_BASE] [--jetty JETTY_BASE] [--wildfly JBOSS_HOME]
+#                      [--weblogic DOMAIN_HOME] [--liberty SERVER_DIR] [--systemd-unit NAME.service] [--purge] [--force]
 #
-#   --tomcat  remove the block install.sh added to <CATALINA_BASE>/bin/setenv.sh
+#   --tomcat ... --systemd-unit   remove what install.sh added for that server (other settings are untouched)
 #   --purge   also delete conf/ (credentials) and logs/ — by default they are kept for audit
 #   --force   uninstall even if running JVMs still use the agent
 #
@@ -12,11 +13,14 @@
 set -euo pipefail
 
 # default: the installation this script belongs to
-PREFIX="$(cd "$(dirname "$0")/.." && pwd)" TOMCAT="" PURGE=0 FORCE=0
+PREFIX="$(cd "$(dirname "$0")/.." && pwd)" PURGE=0 FORCE=0
+INTEG=()
+LIB="$(cd "$(dirname "$0")" && pwd)/integrations.sh"
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
-    --tomcat) TOMCAT="${2:?--tomcat needs CATALINA_BASE}"; shift 2 ;;
+    --tomcat|--jetty|--wildfly|--weblogic|--liberty) INTEG+=("${1#--}:${2:?$1 needs a directory}"); shift 2 ;;
+    --systemd-unit) INTEG+=("systemd:${2:?--systemd-unit needs a unit name}"); shift 2 ;;
     --purge) PURGE=1; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
@@ -43,22 +47,13 @@ if [ -n "$running" ]; then
   [ "$FORCE" = 1 ] || fail "存在运行中的 JVM，确认后可加 --force"
 fi
 
-MARK_BEGIN="# >>> zhuwei-rasp >>>"
-MARK_END="# <<< zhuwei-rasp <<<"
-if [ -n "$TOMCAT" ]; then
-  SETENV="$TOMCAT/bin/setenv.sh"
-  if [ -f "$SETENV" ] && grep -qF "$MARK_BEGIN" "$SETENV"; then
-    tmp="$SETENV.rasp-tmp"
-    awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0==b{skip=1;next} $0==e{skip=0;next} !skip' "$SETENV" > "$tmp"
-    # keep the file's mode, drop the blank line install.sh added before the block
-    awk 'NR==1{prev=$0;next} {print prev; prev=$0} END{if (NR>0 && prev!="") print prev}' "$tmp" > "$tmp.2"
-    chmod --reference="$SETENV" "$tmp.2" 2>/dev/null || chmod "$(stat -f %Lp "$SETENV" 2>/dev/null || echo 755)" "$tmp.2"
-    mv -f "$tmp.2" "$SETENV"
-    rm -f "$tmp"
-    echo "==> 已从 $SETENV 移除 RASP 配置"
-  else
-    echo "==> $SETENV 中没有 RASP 配置"
-  fi
+if [ "${#INTEG[@]}" -gt 0 ]; then
+  [ -f "$LIB" ] || fail "缺少 $LIB"
+  # shellcheck source=integrations.sh
+  . "$LIB"
+  for spec in "${INTEG[@]}"; do
+    "disable_${spec%%:*}" "${spec#*:}"
+  done
 fi
 
 if [ "$PURGE" = 1 ]; then

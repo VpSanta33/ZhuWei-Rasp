@@ -21,6 +21,8 @@ var ErrNotFound = errors.New("not found")
 
 type Store struct {
 	db *sql.DB
+	// OnAudit, if set, receives every audit record after it is stored (e.g. SIEM forwarding).
+	OnAudit func(Audit)
 }
 
 const schema = `
@@ -138,12 +140,15 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // SQLite: serialise writers
-	for _, ddl := range []string{schema, vulnSchema, usersSchema, ftsSchema} {
+	for _, ddl := range []string{schema, vulnSchema, usersSchema, ftsSchema, incidentSchema} {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("init schema: %w", err)
 		}
 	}
 	st := &Store{db: db}
+	if err := st.ensureAlarmFingerprintColumn(); err != nil {
+		return nil, fmt.Errorf("alarm fingerprint migration: %w", err)
+	}
 	if err := st.backfillRollup(); err != nil {
 		return nil, fmt.Errorf("alarm rollup migration: %w", err)
 	}
@@ -574,6 +579,7 @@ type Alarm struct {
 	MatchedInput string `json:"matched_input"`
 	Raw          string `json:"raw,omitempty"`
 	Status       string `json:"status"`
+	Fingerprint  string `json:"fingerprint"` // incident key, see incident.go
 }
 
 func (s *Store) InsertAlarms(as []*Alarm) error {
@@ -583,7 +589,7 @@ func (s *Store) InsertAlarms(as []*Alarm) error {
 	}
 	defer tx.Rollback()
 	st, err := tx.Prepare(`INSERT OR IGNORE INTO alarm(event_id, app_id, agent_id, hostname, event_time, received_at, attack_type,
-		algorithm, action, confidence, url, client_ip, reason, matched_input, raw) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		algorithm, action, confidence, url, client_ip, reason, matched_input, raw, fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -593,16 +599,28 @@ func (s *Store) InsertAlarms(as []*Alarm) error {
 		typ, action, clientIP string
 	}
 	roll := map[rollKey]int64{}
+	incidents := map[string]*incidentDelta{}
 	for _, a := range as {
 		a.ReceivedAt = now()
+		fp, pattern := Fingerprint(a.AppID, a.AttackType, a.Algorithm, a.URL)
+		a.Fingerprint = fp
 		res, err := st.Exec(a.EventID, a.AppID, a.AgentID, a.Hostname, a.EventTime, a.ReceivedAt, a.AttackType, a.Algorithm,
-			a.Action, a.Confidence, a.URL, a.ClientIP, a.Reason, a.MatchedInput, a.Raw)
+			a.Action, a.Confidence, a.URL, a.ClientIP, a.Reason, a.MatchedInput, a.Raw, fp)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 1 { // duplicates (agent retries) are not counted twice
 			roll[rollKey{a.EventTime / 3600000, a.AppID, a.AttackType, a.Action, a.ClientIP}]++
+			d := incidents[fp]
+			if d == nil {
+				d = &incidentDelta{appID: a.AppID, typ: a.AttackType, algorithm: a.Algorithm, pattern: pattern}
+				incidents[fp] = d
+			}
+			d.add(a)
 		}
+	}
+	if err := upsertIncidents(tx, incidents); err != nil {
+		return err
 	}
 	for k, n := range roll {
 		if _, err := tx.Exec(`INSERT INTO alarm_rollup(hour, app_id, attack_type, action, client_ip, n) VALUES(?,?,?,?,?,?)
@@ -615,14 +633,15 @@ func (s *Store) InsertAlarms(as []*Alarm) error {
 }
 
 type AlarmQuery struct {
-	AppID      int64
-	AttackType string
-	Action     string
-	Status     string
-	Keyword    string
-	Since      int64
-	Page       int
-	PageSize   int
+	AppID       int64
+	AttackType  string
+	Action      string
+	Status      string
+	Keyword     string
+	Since       int64
+	Fingerprint string // alarms of one incident
+	Page        int
+	PageSize    int
 }
 
 func (s *Store) QueryAlarms(q AlarmQuery) ([]*Alarm, int, error) {
@@ -642,6 +661,9 @@ func (s *Store) QueryAlarms(q AlarmQuery) ([]*Alarm, int, error) {
 	}
 	if q.Since > 0 {
 		where, args = append(where, "a.event_time >= ?"), append(args, q.Since)
+	}
+	if q.Fingerprint != "" {
+		where, args = append(where, "a.fingerprint = ?"), append(args, q.Fingerprint)
 	}
 	if kw := strings.TrimSpace(q.Keyword); kw != "" {
 		if utf8.RuneCountInString(kw) >= 3 {
@@ -666,7 +688,7 @@ func (s *Store) QueryAlarms(q AlarmQuery) ([]*Alarm, int, error) {
 		q.Page = 1
 	}
 	rows, err := s.db.Query(`SELECT a.event_id, a.app_id, COALESCE(p.name,''), a.agent_id, a.hostname, a.event_time, a.received_at,
-		a.attack_type, a.algorithm, a.action, a.confidence, a.url, a.client_ip, a.reason, a.matched_input, a.status
+		a.attack_type, a.algorithm, a.action, a.confidence, a.url, a.client_ip, a.reason, a.matched_input, a.status, a.fingerprint
 		FROM alarm a LEFT JOIN app p ON p.id = a.app_id WHERE `+cond+` ORDER BY a.event_time DESC LIMIT ? OFFSET ?`,
 		append(args, q.PageSize, (q.Page-1)*q.PageSize)...)
 	if err != nil {
@@ -677,7 +699,7 @@ func (s *Store) QueryAlarms(q AlarmQuery) ([]*Alarm, int, error) {
 	for rows.Next() {
 		a := &Alarm{}
 		if err := rows.Scan(&a.EventID, &a.AppID, &a.AppName, &a.AgentID, &a.Hostname, &a.EventTime, &a.ReceivedAt, &a.AttackType,
-			&a.Algorithm, &a.Action, &a.Confidence, &a.URL, &a.ClientIP, &a.Reason, &a.MatchedInput, &a.Status); err != nil {
+			&a.Algorithm, &a.Action, &a.Confidence, &a.URL, &a.ClientIP, &a.Reason, &a.MatchedInput, &a.Status, &a.Fingerprint); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, a)
@@ -688,10 +710,10 @@ func (s *Store) QueryAlarms(q AlarmQuery) ([]*Alarm, int, error) {
 func (s *Store) GetAlarm(id string) (*Alarm, error) {
 	a := &Alarm{}
 	err := s.db.QueryRow(`SELECT a.event_id, a.app_id, COALESCE(p.name,''), a.agent_id, a.hostname, a.event_time, a.received_at,
-		a.attack_type, a.algorithm, a.action, a.confidence, a.url, a.client_ip, a.reason, a.matched_input, a.raw, a.status
+		a.attack_type, a.algorithm, a.action, a.confidence, a.url, a.client_ip, a.reason, a.matched_input, a.raw, a.status, a.fingerprint
 		FROM alarm a LEFT JOIN app p ON p.id = a.app_id WHERE a.event_id = ?`, id).Scan(&a.EventID, &a.AppID, &a.AppName,
 		&a.AgentID, &a.Hostname, &a.EventTime, &a.ReceivedAt, &a.AttackType, &a.Algorithm, &a.Action, &a.Confidence, &a.URL,
-		&a.ClientIP, &a.Reason, &a.MatchedInput, &a.Raw, &a.Status)
+		&a.ClientIP, &a.Reason, &a.MatchedInput, &a.Raw, &a.Status, &a.Fingerprint)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -716,6 +738,9 @@ func (s *Store) PurgeAlarms(olderThan time.Duration) (int64, error) {
 		return 0, err
 	}
 	if _, err := s.db.Exec(`DELETE FROM alarm_rollup WHERE hour < ?`, cutoff/3600000); err != nil {
+		return 0, err
+	}
+	if err := s.purgeIncidents(cutoff); err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
@@ -783,7 +808,12 @@ type Audit struct {
 }
 
 func (s *Store) AddAudit(user, action, target, detail string) {
-	_, _ = s.db.Exec(`INSERT INTO audit(at, user, action, target, detail) VALUES(?,?,?,?,?)`, now(), user, action, target, detail)
+	at := now()
+	res, err := s.db.Exec(`INSERT INTO audit(at, user, action, target, detail) VALUES(?,?,?,?,?)`, at, user, action, target, detail)
+	if err == nil && s.OnAudit != nil {
+		id, _ := res.LastInsertId()
+		s.OnAudit(Audit{ID: id, At: at, User: user, Action: action, Target: target, Detail: detail})
+	}
 }
 
 func (s *Store) ListAudit(limit int) ([]*Audit, error) {

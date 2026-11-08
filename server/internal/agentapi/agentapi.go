@@ -39,6 +39,8 @@ type API struct {
 	signer *signing.Signer
 	// OnDependencies runs after an agent's component inventory is stored (vulnerability rematch).
 	OnDependencies func()
+	// Forward receives every stored alarm (SIEM); it must not block.
+	Forward func(*store.Alarm)
 	// AlarmRate is the sustained number of alarm events per second accepted per application (burst = 10x).
 	// Excess events are dropped (they remain in the agent's local alarm.log); 0 disables the limit.
 	AlarmRate float64
@@ -341,6 +343,9 @@ func (a *API) alarms(w http.ResponseWriter, r *http.Request, c *reqCtx) {
 	for _, al := range out {
 		al.AppName = c.app.Name
 		a.notify.Alarm(al)
+		if a.Forward != nil {
+			a.Forward(al)
+		}
 	}
 	httpx.OK(w, map[string]any{"accepted": len(out), "dropped": dropped})
 }

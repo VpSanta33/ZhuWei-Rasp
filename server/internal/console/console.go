@@ -85,6 +85,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/components", a.auth(a.listComponents))
 	mux.HandleFunc("GET /api/v1/components/uses", a.auth(a.componentUses))
 	a.registerVulns(mux)
+	a.registerIncidents(mux)
 
 	mux.HandleFunc("GET /api/v1/settings", a.auth(a.getSettings))
 	mux.HandleFunc("PUT /api/v1/settings", a.admin(a.putSettings))

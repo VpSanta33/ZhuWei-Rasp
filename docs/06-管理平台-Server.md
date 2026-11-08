@@ -164,8 +164,24 @@ Agent 拿到的最终配置 = 默认策略 ⊕ 应用绑定的策略 ⊕ 应用�
 
 ### 6.5.3 告警聚合与降噪
 
-- `fingerprint` 相同的告警在 5 分钟窗口内聚合，通知只发首条和计数。
-- 通知按应用负责人路由；支持按等级（block 优先）和静默时段过滤。
+**MVP 已实现：**
+
+- **指纹**：`应用 + 攻击类型 + 检测器 + 归一化路径` 的 SHA-1 前 16 位；路径去掉查询串，数字段、UUID、≥16 位十六进制、≥24 位含数字的令牌分别替换为 `{n}`、`{uuid}`、`{hex}`、`{token}`（例：`/api/item/7?x=1` → `/api/item/{n}`）。
+- **事件表** `incident`：首次/最近发生时间、总数、阻断数、最近来源 IP、研判状态；与告警写入在同一事务中按批聚合更新，重复上报的告警不重复计数；告警表新增 `fingerprint` 列关联事件。
+- **状态**：已修复（`fixed`）的事件再次出现时自动改回 `new` 并累计 `reopened`；误报、忽略的事件保持原状态。按事件研判时可选同时更新其仍为 `new` 的告警。
+- **通知**：Webhook 按事件聚合，首条立即发送，同一事件 5 分钟窗口内的后续告警合并为一条摘要（数量、阻断数、最近来源）。
+- **接口**：`GET /api/v1/incidents`（按应用、类型、状态、是否阻断、时间、关键字过滤）、`GET /api/v1/incidents/{fingerprint}`（含 Top 来源 IP 与最近告警）、`POST /api/v1/incidents/{fingerprint}/status`（`apply_to_alarms` 批量处置）。
+- 升级时在后台分批为历史告警计算指纹，不阻塞告警写入；告警保留期清理时一并删除不再活跃的事件。
+
+目标形态（未实现）：通知按应用负责人路由；静默时段。
+
+### 6.5.3.1 SIEM 转发（MVP 已实现）
+
+- syslog RFC 5424，facility local4；TCP / TLS 使用 RFC 6587 八位组计数分帧，UDP 每条一个数据报（超过 8 KB 截断）。
+- 载荷：JSON（含事件指纹），或 CEF（`CEF:0|ZhuWei|RASP|版本|攻击类型|原因|严重度|扩展字段`，按规范转义 `|`、`=`、`\` 与换行）。
+- 告警按 `-syslog-level`（all / block）转发；审计日志全部转发（severity info）。
+- 后台有界队列（1 万条），连接断开自动重连并对空闲连接做存活探测，避免对端重启后首批消息丢失；溢出或发送失败计入 `rasp_siem_dropped_total`，绝不阻塞告警写入。
+- 配置：`-syslog-addr`、`-syslog-proto`、`-syslog-format`、`-syslog-ca`、`-syslog-level`（亦可用 `RASP_SYSLOG_*` 环境变量）；非 TLS 时启动告警。
 
 ### 6.5.4 紧急开关
 
@@ -231,6 +247,9 @@ Agent 拿到的最终配置 = 默认策略 ⊕ 应用绑定的策略 ⊕ 应用�
 | GET | /api/v1/alarms/{event_id} | 告警详情 |
 | POST | /api/v1/alarms/{fingerprint}/triage | 研判 |
 | POST | /api/v1/whitelists | 新建白名单 |
+| GET | /api/v1/incidents | 事件（告警聚合）列表 |
+| GET | /api/v1/incidents/{fingerprint} | 事件详情、Top 来源 IP、最近告警 |
+| POST | /api/v1/incidents/{fingerprint}/status | 事件研判，可批量处置其告警 |
 | GET | /api/v1/vulns/summary?app_id= | 漏洞库规模、按严重级别统计的匹配结果、最近一次导入 |
 | GET | /api/v1/vulns/findings?app_id=&severity=high&q=&vuln_id= | 匹配结果（组件版本 × 公告），按严重级别排序，含修复版本、所在应用与实例数 |
 | GET | /api/v1/vulns/{id} | 公告详情（别名/CVE、描述、参考链接、受影响包）及其在全部应用中的命中 |

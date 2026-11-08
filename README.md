@@ -72,6 +72,8 @@ WAF 部署在应用之外，依据 HTTP 流量判断攻击；RASP 运行在应�
 - **阻断二次确认**：当策略会使规则开始阻断时，需输入应用名称确认，并记录审计。
 - **组件漏洞匹配**：离线导入 OSV 漏洞数据（含 GitHub Advisory Database），按 Maven 版本规则匹配在用组件，给出严重级别与修复版本；新发现的高危漏洞推送 Webhook。
 - **告警处置**：研判状态、一键加白、全文检索、CSV 导出、Webhook 通知（企业微信、钉钉、SIEM）。
+- **事件聚合**：同一应用、同一攻击类型、同一接口（路径中的数字、UUID 等自动归一）的告警合并为一个事件，按事件研判、批量处置；已修复的事件再次出现时自动重新打开；Webhook 通知按事件聚合，首条立即发送，后续在 5 分钟窗口内汇总。
+- **SIEM 对接**：以 syslog（RFC 5424，TCP / TLS / UDP）转发告警与审计日志，载荷可选 JSON 或 CEF。
 
 ### 安全与合规
 
@@ -84,7 +86,7 @@ WAF 部署在应用之外，依据 HTTP 流量判断攻击；RASP 运行在应�
 
 - 健康检查（`/healthz`、`/readyz`）与 Prometheus 指标（独立内网端口）。
 - 按应用的告警限流、在线备份（含签名私钥）、启动安全检查。
-- 安装 / 升级 / 卸载脚本，systemd 单元，Dockerfile，GitHub Actions CI。
+- 安装 / 升级 / 卸载脚本，可自动接入 Tomcat、Jetty、WildFly / JBoss、WebLogic、Liberty 与 systemd 服务（传统 WebSphere 提供操作指引）；systemd 单元，Dockerfile，GitHub Actions CI。
 
 ## 系统架构
 
@@ -162,9 +164,10 @@ RASP_ADMIN_PASSWORD='<至少 12 位的口令>' ./dist/rasp-server -listen :8480 
 | 部署方式 | systemd：`deploy/server/`（含加固配置与每日备份定时器）；容器：`server/Dockerfile`（非 root、distroless） |
 | 传输安全 | 使用 `-tls-cert` / `-tls-key` 或前置 TLS 代理；Agent 地址使用 `https://` |
 | 账号 | 为每位使用者建立独立账号，或配置 LDAP / AD；集成系统使用 API Token |
-| Agent 安装 | `tools/install.sh --properties <配置> --app-user <应用用户>`，支持升级与回滚 |
+| Agent 安装 | `tools/install.sh --properties <配置> --app-user <应用用户> --tomcat <目录>`（或 `--jetty`、`--wildfly`、`--weblogic`、`--liberty`、`--systemd-unit`），支持升级与回滚 |
 | 备份 | `rasp-server backup -with-key <文件>`，可在服务运行时执行 |
 | 监控 | `RASP_OPS_LISTEN=127.0.0.1:9480` 提供 `/metrics`；告警规则建议见文档第 13 章 |
+| SIEM | `-syslog-addr <主机:端口> -syslog-proto tls -syslog-format cef`，转发全部告警与审计日志 |
 | 漏洞数据 | 定期执行 `rasp-server import-osv`，或配置 `-osv-url` 自动更新 |
 
 完整的检查项、监控告警建议与实测容量见[上线检查清单](docs/13-上线检查清单.md)。

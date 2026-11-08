@@ -72,6 +72,8 @@ Recommended path to production:
 - **Block confirmation**: when a policy change would start blocking, the operator must type the application name to confirm; the change is audited.
 - **Component vulnerability matching**: offline import of OSV data (including the GitHub Advisory Database), Maven version semantics, severity and fixed versions per finding, webhook alerts for new high/critical findings.
 - **Alarm handling**: triage status, one-click allowlisting, full-text search, CSV export, webhook notifications (WeCom, DingTalk, SIEM).
+- **Incident aggregation**: alarms of the same attack type against the same endpoint of an application (numeric, UUID and token path segments normalised) form one incident, triaged as a whole; a fixed incident reopens when the attack recurs; webhook notifications are aggregated per incident - the first alarm is sent at once, the rest summarised per 5-minute window.
+- **SIEM integration**: alarms and audit records forwarded over syslog (RFC 5424 over TCP, TLS or UDP) as JSON or CEF.
 
 ### Security and compliance
 
@@ -84,7 +86,7 @@ Recommended path to production:
 
 - Health checks (`/healthz`, `/readyz`) and Prometheus metrics on a separate internal listener.
 - Per-application alarm rate limiting, online backup (including the signing key), start-up security checks.
-- Install, upgrade and uninstall scripts, systemd units, Dockerfile, GitHub Actions CI.
+- Install, upgrade and uninstall scripts with automatic integration for Tomcat, Jetty, WildFly / JBoss, WebLogic, Liberty and systemd services (step-by-step guidance for traditional WebSphere); systemd units, Dockerfile, GitHub Actions CI.
 
 ## Architecture
 
@@ -162,9 +164,10 @@ The first start creates the `admin` account and generates the policy signing key
 | Deployment | systemd: `deploy/server/` (hardened unit and a daily backup timer); containers: `server/Dockerfile` (non-root, distroless) |
 | Transport security | Use `-tls-cert` / `-tls-key` or a TLS-terminating proxy; agents connect over `https://` |
 | Accounts | Individual accounts for every user, or LDAP / AD; integrations use API tokens |
-| Agent installation | `tools/install.sh --properties <file> --app-user <user>`, with upgrade and rollback support |
+| Agent installation | `tools/install.sh --properties <file> --app-user <user> --tomcat <dir>` (or `--jetty`, `--wildfly`, `--weblogic`, `--liberty`, `--systemd-unit`), with upgrade and rollback support |
 | Backup | `rasp-server backup -with-key <file>`, safe while the service is running |
 | Monitoring | `RASP_OPS_LISTEN=127.0.0.1:9480` exposes `/metrics`; suggested alert rules are in chapter 13 |
+| SIEM | `-syslog-addr <host:port> -syslog-proto tls -syslog-format cef` forwards all alarms and audit records |
 | Vulnerability data | Run `rasp-server import-osv` regularly, or configure `-osv-url` for automatic updates |
 
 The complete checklist, monitoring recommendations and measured capacity are in the [go-live checklist](docs/13-上线检查清单.md) (Chinese).
@@ -244,7 +247,7 @@ The design documents in `docs/` are written in Chinese. Start with chapter 1 for
 
 - `demo-app` and `compat-app` contain intentionally unsafe endpoints and must only run in isolated test environments.
 - Never commit the policy signing key `rasp-sign.key`, database files or `dist/` (all are listed in `.gitignore`).
-- Report security issues in this project privately to the project owner through internal channels; do not disclose details in public issues.
+- Report security or functional problems in this project as GitHub issues with full details.
 
 ## License
 

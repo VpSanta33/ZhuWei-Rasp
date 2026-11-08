@@ -21,6 +21,7 @@ import (
 
 	"zhuwei-rasp/server/internal/agentapi"
 	"zhuwei-rasp/server/internal/console"
+	"zhuwei-rasp/server/internal/forward"
 	"zhuwei-rasp/server/internal/httpx"
 	"zhuwei-rasp/server/internal/ldapauth"
 	"zhuwei-rasp/server/internal/ops"
@@ -62,6 +63,12 @@ func main() {
 	flag.StringVar(&ldapCfg.AdminGroup, "ldap-admin-group", envOr("RASP_LDAP_ADMIN_GROUP", ""), "group DN mapped to the admin role")
 	flag.StringVar(&ldapCfg.OperatorGroup, "ldap-operator-group", envOr("RASP_LDAP_OPERATOR_GROUP", ""), "group DN mapped to the operator role")
 	flag.StringVar(&ldapCfg.ViewerGroup, "ldap-viewer-group", envOr("RASP_LDAP_VIEWER_GROUP", ""), "group DN mapped to the viewer role")
+	siem := forward.Config{}
+	flag.StringVar(&siem.Addr, "syslog-addr", envOr("RASP_SYSLOG_ADDR", ""), "forward alarms and audit records to a SIEM via syslog, host:port (empty = off)")
+	flag.StringVar(&siem.Protocol, "syslog-proto", envOr("RASP_SYSLOG_PROTO", "tcp"), "syslog transport: tcp, tls or udp")
+	flag.StringVar(&siem.Format, "syslog-format", envOr("RASP_SYSLOG_FORMAT", "json"), "syslog payload: json or cef")
+	flag.StringVar(&siem.CAFile, "syslog-ca", envOr("RASP_SYSLOG_CA", ""), "PEM CA bundle for -syslog-proto tls")
+	flag.StringVar(&siem.Level, "syslog-level", envOr("RASP_SYSLOG_LEVEL", "all"), "alarms to forward: all or block (audit records are always forwarded)")
 	osvURL := flag.String("osv-url", envOr("RASP_OSV_URL", ""), "download OSV advisories from this URL periodically, e.g. https://osv-vulnerabilities.storage.googleapis.com/Maven/all.zip (empty = off; import offline with `rasp-server import-osv`)")
 	osvEvery := flag.Duration("osv-interval", 24*time.Hour, "interval for -osv-url updates")
 	signKey := flag.String("sign-key", envOr("RASP_SIGN_KEY", ""), "policy signing key (PKCS#8 PEM, ECDSA P-256; default <db dir>/rasp-sign.key, created if missing)")
@@ -109,6 +116,16 @@ func main() {
 	agents := agentapi.New(st, notifier, signer)
 	agents.OnDependencies = vulns.Trigger
 	agents.AlarmRate = *alarmRate
+	if siem.Addr != "" {
+		siem.Version = "0.1.0"
+		fwd, err := forward.New(siem)
+		if err != nil {
+			log.Fatalf("syslog: %v", err)
+		}
+		agents.Forward = fwd.Alarm
+		st.OnAudit = fwd.Audit
+		log.Printf("SIEM forwarding: %s over %s, format %s, alarms: %s", siem.Addr, siem.Protocol, siem.Format, siem.Level)
+	}
 	agents.Register(mux)
 	consoleAPI := console.New(st, *agentURL, signer)
 	consoleAPI.Vulns = vulns
@@ -128,12 +145,22 @@ func main() {
 		vulns.StartAutoUpdate(*osvURL, *osvEvery, func(detail string) { st.AddAudit("system", "import_vulns", *osvURL, detail) })
 	}
 	warnings := configWarnings(*listen, *tlsCert, *agentURL, *opsListen, st.GetSetting("notify_webhook", ""))
+	if siem.Addr != "" && siem.Protocol != "tls" {
+		warnings = append(warnings, "SIEM forwarding over "+siem.Protocol+" is not encrypted (alarm data leaves the platform in clear text); use -syslog-proto tls")
+	}
 	if ldapCfg.Enabled() && !ldapCfg.Encrypted() {
 		warnings = append(warnings, "LDAP connection is not encrypted (use ldaps:// or -ldap-starttls): user passwords would be sent in clear text")
 	}
 	for _, w := range warnings {
 		log.Printf("CONFIG WARNING: %s", w)
 	}
+	go func() { // group alarms stored before incidents existed; small batches, ingestion continues
+		if n, err := st.BackfillIncidents(2000); err != nil {
+			log.Printf("incident backfill: %v", err)
+		} else if n > 0 {
+			log.Printf("incident backfill finished: %d alarms grouped", n)
+		}
+	}()
 	ready := func() error { return st.Ping() }
 	ops.Health(mux, ready)
 	registerGauges(st)
