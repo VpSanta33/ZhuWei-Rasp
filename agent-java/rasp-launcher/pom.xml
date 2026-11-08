@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.zhuwei.rasp</groupId>
+        <artifactId>rasp-parent</artifactId>
+        <version>0.1.0</version>
+    </parent>
+    <artifactId>rasp-launcher</artifactId>
+    <description>-javaagent entry. Contains no logic besides class-loader setup.</description>
+
+    <build>
+        <finalName>rasp-launcher</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Main-Class>com.zhuwei.rasp.launcher.AttachMain</Main-Class>
+                            <Premain-Class>com.zhuwei.rasp.launcher.AgentLauncher</Premain-Class>
+                            <Agent-Class>com.zhuwei.rasp.launcher.AgentLauncher</Agent-Class>
+                            <Can-Redefine-Classes>true</Can-Redefine-Classes>
+                            <Can-Retransform-Classes>true</Can-Retransform-Classes>
+                            <Can-Set-Native-Method-Prefix>true</Can-Set-Native-Method-Prefix>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
