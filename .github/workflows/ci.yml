@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Build and unit-test the agent (JDK 11 bytecode)
+        run: mvn -B clean package
+        working-directory: agent-java
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: server/web/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: Build console (type check + bundle)
+        run: npm ci --no-audit --no-fund && npm run build
+        working-directory: server/web
+      - name: Vet and test
+        run: go vet ./... && go test ./...
+        working-directory: server
+      - name: Browser end-to-end tests against the real Go server
+        run: npx playwright install --with-deps chromium && npm run test:e2e
+        working-directory: server/web
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results
+          path: server/web/test-results

@@ -1,0 +1,14 @@
+# Daily online backup; pair with rasp-backup.timer. Keeps 14 days.
+[Unit]
+Description=ZhuWei-RASP database backup
+
+[Service]
+Type=oneshot
+User=rasp
+Group=rasp
+UMask=0077
+EnvironmentFile=/etc/rasp/server.env
+ExecStart=/bin/sh -c 'install -d -m 0700 /var/lib/rasp/backup && /usr/local/bin/rasp-server backup -with-key /var/lib/rasp/backup/rasp-$(date +%%Y%%m%%d-%%H%%M%%S).db && find /var/lib/rasp/backup -name "rasp-*" -mtime +14 -delete'
+ReadWritePaths=/var/lib/rasp
+ProtectSystem=strict
+NoNewPrivileges=yes

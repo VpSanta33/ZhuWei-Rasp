@@ -56,6 +56,9 @@ public final class DemoApp {
         servlet(tomcat, ctx, "exec", "/exec", DemoApp::exec);
         servlet(tomcat, ctx, "json", "/json", DemoApp::json);
         servlet(tomcat, ctx, "async", "/async", DemoApp::async);
+        servlet(tomcat, ctx, "thread", "/thread", DemoApp::thread);
+        servlet(tomcat, ctx, "cf", "/cf", DemoApp::completable);
+        servlet(tomcat, ctx, "parallel", "/parallel", DemoApp::parallel);
         tomcat.start();
         System.out.println("demo app listening on http://127.0.0.1:" + port);
         tomcat.getServer().await();
@@ -128,6 +131,63 @@ public final class DemoApp {
             resp.setStatus(e.getCause() instanceof SecurityException ? 403 : 500);
             resp.getWriter().write("task failed: " + e.getCause() + "\n");
         }
+    }
+
+    private static String readData(String name) {
+        try (InputStream in = new FileInputStream(new File(dataDir, name))) {
+            return Thread.currentThread().getName() + ": " + new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    private static void finish(HttpServletResponse resp, java.util.function.Supplier<String> work) throws IOException {
+        try {
+            resp.getWriter().write(work.get());
+        } catch (RuntimeException e) {
+            Throwable c = e;
+            while (c.getCause() != null && !(c instanceof SecurityException)) {
+                c = c.getCause();
+            }
+            resp.setStatus(c instanceof SecurityException ? 403 : 500);
+            resp.getWriter().write("task failed: " + c + "\n");
+        }
+    }
+
+    /** GET /thread?name=readme.txt  (file is read on a new Thread) */
+    private static void thread(HttpServletRequest req, HttpServletResponse resp) throws Exception {
+        String name = req.getParameter("name");
+        String[] out = new String[1];
+        RuntimeException[] err = new RuntimeException[1];
+        Thread t = new Thread(() -> {
+            try {
+                out[0] = readData(name);
+            } catch (RuntimeException e) {
+                err[0] = e;
+            }
+        }, "demo-raw-thread");
+        t.start();
+        t.join();
+        finish(resp, () -> {
+            if (err[0] != null) {
+                throw err[0];
+            }
+            return out[0];
+        });
+    }
+
+    /** GET /cf?name=readme.txt  (CompletableFuture on the common ForkJoinPool) */
+    private static void completable(HttpServletRequest req, HttpServletResponse resp) throws Exception {
+        String name = req.getParameter("name");
+        finish(resp, () -> java.util.concurrent.CompletableFuture.supplyAsync(() -> readData(name)).join());
+    }
+
+    /** GET /parallel?name=readme.txt  (parallel stream; some elements run on ForkJoin workers) */
+    private static void parallel(HttpServletRequest req, HttpServletResponse resp) throws Exception {
+        String name = req.getParameter("name");
+        finish(resp, () -> java.util.stream.IntStream.range(0, 8).parallel()
+                .mapToObj(i -> readData(name).split(":")[0]).distinct().sorted()
+                .collect(java.util.stream.Collectors.joining(",")));
     }
 
     interface Handler {

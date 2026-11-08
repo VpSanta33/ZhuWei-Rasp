@@ -27,6 +27,21 @@ func NewNotifier(st *store.Store) *Notifier {
 	return n
 }
 
+// Send posts a plain message (bot "text" format plus a machine-readable event) to the configured webhook.
+func (n *Notifier) Send(text string, event any) {
+	url := n.st.GetSetting("notify_webhook", "")
+	if url == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]any{"msgtype": "text", "text": map[string]string{"content": text}, "event": event})
+	resp, err := n.client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("webhook notify failed: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
 func (n *Notifier) Alarm(a *store.Alarm) {
 	select {
 	case n.queue <- a:

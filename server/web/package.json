@@ -1,0 +1,30 @@
+{
+  "name": "zhuwei-rasp-console",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "vue-tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "vue": "3.5.44",
+    "vue-router": "5.4.0",
+    "@tanstack/vue-query": "5.105.0",
+    "@lucide/vue": "1.66.0"
+  },
+  "devDependencies": {
+    "vite": "8.3.5",
+    "@vitejs/plugin-vue": "6.0.10",
+    "typescript": "6.0.3",
+    "vue-tsc": "3.3.14",
+    "@playwright/test": "1.64.1",
+    "@types/node": "24.19.2"
+  }
+}

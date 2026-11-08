@@ -1,7 +1,21 @@
-// Package web embeds the console front end (plain Vue 3 global build, no bundler needed).
+// Package web embeds the compiled Vue console. Run npm ci && npm run build here before go build.
 package web
 
-import "embed"
+import (
+	"embed"
+	"io/fs"
+)
 
-//go:embed index.html app.js style.css vendor
-var FS embed.FS
+//go:embed all:dist
+var assets embed.FS
+
+// FS serves only compiled public assets, never frontend source or dependencies.
+var FS = publicFS()
+
+func publicFS() fs.FS {
+	public, err := fs.Sub(assets, "dist")
+	if err != nil {
+		panic(err)
+	}
+	return public
+}

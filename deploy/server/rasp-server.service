@@ -1,0 +1,40 @@
+# systemd unit for the ZhuWei-RASP management server.
+#   useradd --system --home /var/lib/rasp --shell /usr/sbin/nologin rasp
+#   install -m 0755 rasp-server /usr/local/bin/ && install -d -o rasp -g rasp -m 0700 /var/lib/rasp
+#   install -m 0640 -g rasp server.env /etc/rasp/server.env
+#   systemctl enable --now rasp-server
+[Unit]
+Description=ZhuWei-RASP management server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rasp
+Group=rasp
+EnvironmentFile=/etc/rasp/server.env
+ExecStart=/usr/local/bin/rasp-server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+LimitNOFILE=65536
+UMask=0077
+
+# hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/rasp
+
+[Install]
+WantedBy=multi-user.target

@@ -15,9 +15,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>Keys are weak and compared by identity: business {@code hashCode/equals} are never called, and
  * tasks that are rejected or never run do not leak.</p>
  *
- * <p>Not covered: ForkJoinPool (parallel streams, CompletableFuture default executor), raw
- * {@code new Thread()}, scheduled executors' delayed tasks, and executors whose subclasses override
- * {@code beforeExecute} without calling super.</p>
+ * <p>The same weak map also serves plain {@code java.lang.Thread}s (keyed by the thread on
+ * {@code start()}, installed for the duration of {@code run()}) and ForkJoinTasks (keyed on construction,
+ * installed for the duration of {@code doExec()}). Those use {@link #enterTask}/{@link #exitTask}, which
+ * keep a per-thread stack because ForkJoin tasks nest (a joining worker runs other tasks inline).</p>
+ *
+ * <p>Not covered: Thread subclasses that override {@code run()} (and virtual threads), executors whose
+ * subclasses override {@code beforeExecute} without calling super, and custom executors that are neither
+ * ThreadPoolExecutor nor ForkJoinPool. A long-lived plain thread started during a request (e.g. a lazily
+ * started background worker) keeps that request's context for its whole life.</p>
  */
 public final class AsyncContexts {
 
@@ -39,6 +45,54 @@ public final class AsyncContexts {
             return; // degrade instead of growing without bound
         }
         PENDING.put(new Key(task, QUEUE), ctx.snapshotForAsync());
+    }
+
+    /** Thread.start() / ForkJoinTask constructor. Only plain Thread instances, see class comment. */
+    public static void created(Object task) {
+        if (task instanceof Thread && task.getClass() != Thread.class) {
+            return;
+        }
+        submit(task);
+    }
+
+    private static final Object NONE = new Object();
+    private static final ThreadLocal<java.util.ArrayDeque<Object>> STACK =
+            ThreadLocal.withInitial(java.util.ArrayDeque::new);
+    private static final int MAX_STACK = 1024;
+
+    /** Thread.run() / ForkJoinTask.doExec() entered: push the current context, install the task's one. */
+    public static void enterTask(Object task, boolean enabled) {
+        java.util.ArrayDeque<Object> st = STACK.get();
+        RequestContext cur = ContextHolder.get();
+        if (st.size() >= MAX_STACK) {
+            st.clear(); // unbalanced somewhere; reset rather than grow
+        }
+        st.push(cur == null ? NONE : cur);
+        if (task == null || PENDING.isEmpty()) {
+            return;
+        }
+        RequestContext ctx = PENDING.remove(new Lookup(task));
+        // never replace a real request context (e.g. a request thread helping with a parallel stream)
+        if (enabled && ctx != null && (cur == null || cur.async)) {
+            ContextHolder.set(ctx);
+        }
+    }
+
+    /** Matching exit: restore whatever was current before {@link #enterTask}. */
+    public static void exitTask() {
+        java.util.ArrayDeque<Object> st = STACK.get();
+        Object prev = st.poll();
+        if (prev == null) {
+            return;
+        }
+        RequestContext cur = ContextHolder.get();
+        if (prev == NONE) {
+            if (cur != null && cur.async) {
+                ContextHolder.clear();
+            }
+        } else if (prev != cur && (cur == null || cur.async)) {
+            ContextHolder.set((RequestContext) prev);
+        }
     }
 
     /** Called on beforeExecute(): install the task's context on the worker thread. */

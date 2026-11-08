@@ -152,4 +152,56 @@ class RequestContextTest {
         AsyncContexts.submit(new Object());
         assertEquals(before, AsyncContexts.pending());
     }
+
+    @Test
+    void nestedTasksRestoreOuterContext() {
+        RequestContext a = ctx("text/plain", "a=1", "", 0);
+        RequestContext b = ctx("text/plain", "b=2", "", 0);
+        Object outer = new Object();
+        Object inner = new Object();
+        ContextHolder.set(a);
+        AsyncContexts.created(outer);
+        ContextHolder.set(b);
+        AsyncContexts.created(inner);
+        ContextHolder.clear();
+
+        AsyncContexts.enterTask(outer, true);          // worker runs task of request a
+        assertEquals("a=1", ContextHolder.get().queryString());
+        AsyncContexts.enterTask(inner, true);          // ...and helps with a task of request b inline
+        assertEquals("b=2", ContextHolder.get().queryString());
+        AsyncContexts.exitTask();
+        assertEquals("a=1", ContextHolder.get().queryString());
+        AsyncContexts.exitTask();
+        assertNull(ContextHolder.get());
+        AsyncContexts.exitTask();                      // unbalanced exit (hooked mid-flight) is harmless
+        assertNull(ContextHolder.get());
+    }
+
+    @Test
+    void taskNeverReplacesRealRequestAndOnlyPlainThreadsAreTracked() {
+        RequestContext real = ctx("text/plain", "r=1", "", 0);
+        ContextHolder.set(real);
+        Object task = new Object();
+        AsyncContexts.created(task);
+        int before = AsyncContexts.pending();
+        AsyncContexts.created(new Thread() { });       // subclass: skipped
+        assertEquals(before, AsyncContexts.pending());
+        AsyncContexts.enterTask(task, true);           // request thread runs a forked task itself
+        assertSame(real, ContextHolder.get());
+        AsyncContexts.exitTask();
+        assertSame(real, ContextHolder.get());
+    }
+
+    @Test
+    void disabledPropagationKeepsStackBalanced() {
+        RequestContext a = ctx("text/plain", "a=1", "", 0);
+        Object t = new Object();
+        ContextHolder.set(a);
+        AsyncContexts.created(t);
+        ContextHolder.clear();
+        AsyncContexts.enterTask(t, false);
+        assertNull(ContextHolder.get());
+        AsyncContexts.exitTask();
+        assertNull(ContextHolder.get());
+    }
 }

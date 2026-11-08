@@ -202,6 +202,11 @@ final class RequestContext {
 1. **ThreadLocal 生命周期**：入口 `onEnter` 时创建（嵌套的 Filter/Servlet 只在最外层创建），`onReturn`/`onThrow` 时在最外层清理。线程池复用时如果残留旧上下文，会造成误报和内存泄漏。
 2. **不提前消费请求体**：读取 `getParameter` 会触发表单解析，可能改变业务行为（例如业务自己要读 InputStream）。正确做法是 Hook `ServletInputStream.read` 被动地“旁路复制”业务实际读到的数据，参数在业务调用过 `getParameter` 之后再取，或在检测时才懒加载。
 3. **异步线程**：`@Async`、线程池、CompletableFuture 中的 Sink 调用拿不到 ThreadLocal。首版可以接受（此时检测退化为“无请求上下文”模式，只做基于参数和栈的检测）；二期 Hook `ThreadPoolExecutor.execute` 等实现上下文传递（参考 TransmittableThreadLocal）。
+   **MVP 已实现**，任务对象从不被包装或替换：
+   - ThreadPoolExecutor：`execute` 记录提交方上下文快照（弱引用、按对象身份），`beforeExecute/afterExecute` 安装与清除。
+   - ForkJoinPool：`ForkJoinTask` 构造时记录，`doExec()` 期间安装（JDK 11–17 返回 int，新版本返回 void，按前缀匹配描述符）；工作线程会内联执行其他任务，因此用每线程栈保存/恢复外层上下文。
+   - `new Thread(runnable)`：仅普通 `java.lang.Thread` 实例，`start()` 时记录、`run()` 期间安装。
+   - 原则：异步上下文永远不覆盖真实的请求上下文；进入/退出无论开关与熔断状态都成对执行，保证栈平衡。
 4. **用户输入提取**：对参数、Header（白名单列表，如 UA、Referer、Cookie 值）、JSON Body 的所有叶子值、Multipart 文件名做扁平化，提取出 `userInputs`，并缓存在上下文中供各个检测项复用。
 5. **防重入**：Agent 自身执行时（例如上报网络请求、读规则文件）也会触发 Hook。用一个 ThreadLocal `inRasp` 标志位，Agent 内部代码执行期间跳过所有 Hook。
 

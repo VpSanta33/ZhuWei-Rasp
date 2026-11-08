@@ -59,6 +59,15 @@ public final class RaspSpyHandler implements SpyHandler {
                 case ASYNC_AFTER:
                     AsyncContexts.after();
                     return null;
+                case TASK_CREATE:
+                    if (Breaker.allow() && ConfigManager.current().asyncContext) {
+                        AsyncContexts.created(self);
+                    }
+                    return null;
+                case TASK_RUN:
+                    // always enter/exit in pairs, whatever the breaker/config says, to keep the stack balanced
+                    AsyncContexts.enterTask(self, ConfigManager.current().asyncContext);
+                    return null;
                 default:
                     return null; // BODY_READ acts on return
             }
@@ -96,6 +105,10 @@ public final class RaspSpyHandler implements SpyHandler {
     @Override
     public void onReturn(int hookId, Object self, Object[] args) {
         HookPoint h = HookRegistry.get(hookId);
+        if (h != null && h.kind == HookPoint.Kind.TASK_RUN) {
+            taskExit();
+            return;
+        }
         if (h == null || h.kind != HookPoint.Kind.REQUEST_ENTRY || !Guard.enter()) {
             return;
         }
@@ -119,9 +132,26 @@ public final class RaspSpyHandler implements SpyHandler {
         }
     }
 
+    private static void taskExit() {
+        if (!Guard.enter()) {
+            return;
+        }
+        try {
+            AsyncContexts.exitTask();
+        } catch (Throwable t) {
+            Breaker.recordError();
+        } finally {
+            Guard.exit();
+        }
+    }
+
     @Override
     public boolean onThrow(int hookId, Object self, Object[] args, Throwable t) {
         HookPoint h = HookRegistry.get(hookId);
+        if (h != null && h.kind == HookPoint.Kind.TASK_RUN) {
+            taskExit();
+            return false;
+        }
         if (h == null || h.kind != HookPoint.Kind.REQUEST_ENTRY || !Guard.enter()) {
             return false;
         }

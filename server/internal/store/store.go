@@ -79,6 +79,19 @@ CREATE TABLE IF NOT EXISTS alarm (
 );
 CREATE INDEX IF NOT EXISTS idx_alarm_time ON alarm(event_time);
 CREATE INDEX IF NOT EXISTS idx_alarm_app ON alarm(app_id, event_time);
+CREATE INDEX IF NOT EXISTS idx_alarm_type_action ON alarm(attack_type, action, event_time);
+CREATE INDEX IF NOT EXISTS idx_alarm_status ON alarm(status, event_time);
+CREATE INDEX IF NOT EXISTS idx_alarm_ip ON alarm(client_ip, event_time);
+-- Hourly counts maintained on insert; dashboards read these instead of scanning raw alarms.
+CREATE TABLE IF NOT EXISTS alarm_rollup (
+  hour        INTEGER NOT NULL,           -- event_time / 3600000
+  app_id      INTEGER NOT NULL,
+  attack_type TEXT NOT NULL,
+  action      TEXT NOT NULL,
+  client_ip   TEXT NOT NULL,
+  n           INTEGER NOT NULL,
+  PRIMARY KEY (hour, app_id, attack_type, action, client_ip)
+);
 CREATE TABLE IF NOT EXISTS component (
   agent_id   TEXT NOT NULL,
   app_id     INTEGER NOT NULL,
@@ -107,10 +120,28 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // SQLite: serialise writers
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("init schema: %w", err)
+	for _, ddl := range []string{schema, vulnSchema, usersSchema} {
+		if _, err := db.Exec(ddl); err != nil {
+			return nil, fmt.Errorf("init schema: %w", err)
+		}
 	}
-	return &Store{db: db}, nil
+	st := &Store{db: db}
+	if err := st.backfillRollup(); err != nil {
+		return nil, fmt.Errorf("alarm rollup migration: %w", err)
+	}
+	return st, nil
+}
+
+// backfillRollup builds alarm_rollup once for databases created before it existed.
+func (s *Store) backfillRollup() error {
+	if s.GetSetting("alarm_rollup_v1", "") == "done" {
+		return nil
+	}
+	if _, err := s.db.Exec(`INSERT OR REPLACE INTO alarm_rollup(hour, app_id, attack_type, action, client_ip, n)
+		SELECT event_time / 3600000, app_id, attack_type, action, client_ip, COUNT(*) FROM alarm GROUP BY 1, 2, 3, 4, 5`); err != nil {
+		return err
+	}
+	return s.SetSetting("alarm_rollup_v1", "done")
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -374,6 +405,8 @@ type ComponentSummary struct {
 	SHA1      string `json:"sha1"`
 	Apps      string `json:"apps"`
 	Instances int64  `json:"instances"`
+	Vulns     int64  `json:"vulns"`        // advisories affecting this version
+	Severity  string `json:"max_severity"` // worst of them, "" when none
 }
 
 func (s *Store) QueryComponents(appID int64, keyword string, limit int) ([]*ComponentSummary, error) {
@@ -390,8 +423,14 @@ func (s *Store) QueryComponents(appID int64, keyword string, limit int) ([]*Comp
 		limit = 2000
 	}
 	rows, err := s.db.Query(`SELECT c.group_id, c.artifact, c.version, MIN(c.source), MIN(c.sha1),
-		GROUP_CONCAT(DISTINCT a.name || '/' || a.env), COUNT(DISTINCT c.agent_id)
-		FROM component c JOIN app a ON a.id = c.app_id WHERE `+strings.Join(where, " AND ")+`
+		GROUP_CONCAT(DISTINCT a.name || '/' || a.env), COUNT(DISTINCT c.agent_id),
+		COALESCE(MAX(vs.n), 0), COALESCE(MAX(vs.worst), '')
+		FROM component c JOIN app a ON a.id = c.app_id
+		LEFT JOIN (SELECT cv.group_id, cv.artifact, cv.version, COUNT(*) AS n,
+			CASE MAX(`+severityRank+`) WHEN 5 THEN 'critical' WHEN 4 THEN 'high' WHEN 3 THEN 'medium' WHEN 2 THEN 'low' WHEN 1 THEN 'none' ELSE 'unknown' END AS worst
+			FROM component_vuln cv JOIN vuln v ON v.id = cv.vuln_id GROUP BY cv.group_id, cv.artifact, cv.version) vs
+			ON vs.group_id = c.group_id AND vs.artifact = c.artifact AND vs.version = c.version
+		WHERE `+strings.Join(where, " AND ")+`
 		GROUP BY c.group_id, c.artifact, c.version ORDER BY c.artifact, c.version LIMIT ?`, append(args, limit)...)
 	if err != nil {
 		return nil, err
@@ -400,7 +439,7 @@ func (s *Store) QueryComponents(appID int64, keyword string, limit int) ([]*Comp
 	var out []*ComponentSummary
 	for rows.Next() {
 		c := &ComponentSummary{}
-		if err := rows.Scan(&c.Group, &c.Artifact, &c.Version, &c.Source, &c.SHA1, &c.Apps, &c.Instances); err != nil {
+		if err := rows.Scan(&c.Group, &c.Artifact, &c.Version, &c.Source, &c.SHA1, &c.Apps, &c.Instances, &c.Vulns, &c.Severity); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -523,10 +562,26 @@ func (s *Store) InsertAlarms(as []*Alarm) error {
 		return err
 	}
 	defer st.Close()
+	type rollKey struct {
+		hour, app             int64
+		typ, action, clientIP string
+	}
+	roll := map[rollKey]int64{}
 	for _, a := range as {
 		a.ReceivedAt = now()
-		if _, err := st.Exec(a.EventID, a.AppID, a.AgentID, a.Hostname, a.EventTime, a.ReceivedAt, a.AttackType, a.Algorithm,
-			a.Action, a.Confidence, a.URL, a.ClientIP, a.Reason, a.MatchedInput, a.Raw); err != nil {
+		res, err := st.Exec(a.EventID, a.AppID, a.AgentID, a.Hostname, a.EventTime, a.ReceivedAt, a.AttackType, a.Algorithm,
+			a.Action, a.Confidence, a.URL, a.ClientIP, a.Reason, a.MatchedInput, a.Raw)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 1 { // duplicates (agent retries) are not counted twice
+			roll[rollKey{a.EventTime / 3600000, a.AppID, a.AttackType, a.Action, a.ClientIP}]++
+		}
+	}
+	for k, n := range roll {
+		if _, err := tx.Exec(`INSERT INTO alarm_rollup(hour, app_id, attack_type, action, client_ip, n) VALUES(?,?,?,?,?,?)
+			ON CONFLICT(hour, app_id, attack_type, action, client_ip) DO UPDATE SET n = n + excluded.n`,
+			k.hour, k.app, k.typ, k.action, k.clientIP, n); err != nil {
 			return err
 		}
 	}
@@ -623,8 +678,12 @@ func (s *Store) SetAlarmStatus(id, status string) error {
 }
 
 func (s *Store) PurgeAlarms(olderThan time.Duration) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM alarm WHERE event_time < ?`, time.Now().Add(-olderThan).UnixMilli())
+	cutoff := time.Now().Add(-olderThan).UnixMilli()
+	res, err := s.db.Exec(`DELETE FROM alarm WHERE event_time < ?`, cutoff)
 	if err != nil {
+		return 0, err
+	}
+	if _, err := s.db.Exec(`DELETE FROM alarm_rollup WHERE hour < ?`, cutoff/3600000); err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
@@ -637,20 +696,21 @@ type Count struct {
 
 // AlarmStats aggregates alarms since the given time by a whitelisted column.
 func (s *Store) AlarmStats(since int64, column string, limit int) ([]Count, error) {
+	// Reads the hourly rollup (hour granularity: "since" is rounded down to the hour).
 	cols := map[string]string{
-		"attack_type": "a.attack_type", "action": "a.action", "client_ip": "a.client_ip", "app": "COALESCE(p.name,'')",
-		"day": "strftime('%Y-%m-%d', a.event_time / 1000, 'unixepoch', 'localtime')",
+		"attack_type": "r.attack_type", "action": "r.action", "client_ip": "r.client_ip", "app": "COALESCE(p.name,'')",
+		"day": "strftime('%Y-%m-%d', r.hour * 3600, 'unixepoch', 'localtime')",
 	}
 	expr, ok := cols[column]
 	if !ok {
 		return nil, fmt.Errorf("bad stats column %q", column)
 	}
-	order := "COUNT(*) DESC"
+	order := "SUM(r.n) DESC"
 	if column == "day" {
 		order = "k"
 	}
-	rows, err := s.db.Query(`SELECT `+expr+` AS k, COUNT(*) FROM alarm a LEFT JOIN app p ON p.id = a.app_id
-		WHERE a.event_time >= ? GROUP BY k ORDER BY `+order+` LIMIT ?`, since, limit)
+	rows, err := s.db.Query(`SELECT `+expr+` AS k, SUM(r.n) FROM alarm_rollup r LEFT JOIN app p ON p.id = r.app_id
+		WHERE r.hour >= ? GROUP BY k ORDER BY `+order+` LIMIT ?`, since/3600000, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -709,4 +769,48 @@ func (s *Store) ListAudit(limit int) ([]*Audit, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// Ping checks that the database answers (readiness probe).
+func (s *Store) Ping() error {
+	var one int
+	return s.db.QueryRow(`SELECT 1`).Scan(&one)
+}
+
+// FleetCounts returns gauges for metrics: apps, instances (total/online), alarms in the last 24 hours.
+func (s *Store) FleetCounts(onlineSince int64) (map[string]float64, error) {
+	out := map[string]float64{}
+	var apps, total, online, alarms int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM app`).Scan(&apps); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN last_heartbeat >= ? THEN 1 ELSE 0 END), 0) FROM agent_instance`, onlineSince).Scan(&total, &online); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM alarm WHERE event_time >= ?`, now()-24*3600*1000).Scan(&alarms); err != nil {
+		return nil, err
+	}
+	out["apps"], out["instances"], out["instances_online"], out["alarms_24h"] = float64(apps), float64(total), float64(online), float64(alarms)
+	return out, nil
+}
+
+// Backup writes a consistent snapshot of the live database to path (SQLite VACUUM INTO; readers and
+// writers continue meanwhile) and verifies it with an integrity check. path must not exist.
+func (s *Store) Backup(path string) error {
+	if _, err := s.db.Exec(`VACUUM INTO ?`, path); err != nil {
+		return err
+	}
+	check, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer check.Close()
+	var result string
+	if err := check.QueryRow(`PRAGMA integrity_check`).Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("backup integrity check failed: %s", result)
+	}
+	return nil
 }

@@ -45,6 +45,20 @@ public final class HookRegistry {
         add("tpe-after", Kind.ASYNC_AFTER, null, "java/util/concurrent/ThreadPoolExecutor", null,
                 new String[]{"afterExecute"}, "(Ljava/lang/Runnable;Ljava/lang/Throwable;)V", false, null);
 
+        // Raw threads: only plain java.lang.Thread instances (new Thread(runnable)); subclasses such as
+        // ForkJoinWorkerThread, virtual threads or framework threads are skipped in AsyncContexts.
+        add("thread-start", Kind.TASK_CREATE, null, "java/lang/Thread", null,
+                new String[]{"start"}, "()V", false, null);
+        add("thread-run", Kind.TASK_RUN, null, "java/lang/Thread", null,
+                new String[]{"run"}, "()V", true, null);
+        // ForkJoinPool (parallel streams, CompletableFuture default executor): every task, including
+        // RunnableExecuteAction wrappers and fork()ed subtasks, is created on the submitting thread.
+        // doExec() returns int on JDK 11-17 and void on newer JDKs, hence the prefix descriptor.
+        add("fj-task-create", Kind.TASK_CREATE, null, "java/util/concurrent/ForkJoinTask", null,
+                new String[]{"<init>"}, "()V", false, null);
+        add("fj-task-exec", Kind.TASK_RUN, null, "java/util/concurrent/ForkJoinTask", null,
+                new String[]{"doExec"}, "()*", true, null);
+
         // ---------------------------------------------------------------- command
         add("process-start", Kind.SINK, CheckType.COMMAND, "java/lang/ProcessImpl", null,
                 new String[]{"start"}, "([Ljava/lang/String;Ljava/util/Map;Ljava/lang/String;[Ljava/lang/ProcessBuilder$Redirect;Z)Ljava/lang/Process;",

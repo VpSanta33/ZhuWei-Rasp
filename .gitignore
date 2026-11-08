@@ -7,3 +7,7 @@ dist/
 .idea/
 *.iml
 rasp-sign.key*
+node_modules/
+*.tsbuildinfo
+playwright-report/
+test-results/

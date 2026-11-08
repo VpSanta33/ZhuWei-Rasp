@@ -6,6 +6,8 @@
 
 ## 项目状态
 
+> 上线前请先阅读 [第 13 章 上线检查清单](docs/13-上线检查清单.md)：平台部分已具备生产部署条件，检测算法仍是开启阻断前必须补齐的前提。
+
 **MVP 已完成，适合 POC 与内部试点，尚不能直接作为生产防护上线。** 端到端链路（接入 → Hook → 检测 → 告警/阻断 → 平台管理 → 策略签名下发）已在 demo 应用上验证；单元测试全部通过；粗测 Agent 开销在测量误差范围内。
 
 上线前的建议顺序：
@@ -22,6 +24,7 @@
 | 被保护的 Java 应用 | JDK 11+（JDK 21+ 动态 attach 会打印 JEP 451 警告，建议用 `-XX:+EnableDynamicAgentLoading` 或改用 `-javaagent`） |
 | 构建 Agent | JDK 17+、Maven 3.9+ |
 | 构建平台 | Go 1.27+（纯 Go SQLite，`CGO_ENABLED=0` 即可交叉编译） |
+| 构建前端 | Node.js >=22.12、npm；Vue 3.5 + TypeScript + Vite 8，运行平台时不需要 Node.js |
 | 运行平台 | 单二进制 + 一个 SQLite 文件；生产环境请放在 TLS 之后（`-tls-cert/-tls-key` 或反向代理） |
 
 ## 代码结构
@@ -33,6 +36,7 @@ agent-java/            Maven 多模块（需要 JDK 11+ 运行，用 JDK 17+ 构
   rasp-core/           Hook 定义、ASM 字节码增强、请求上下文、规则引擎、策略、熔断、上报
   demo-app/            内嵌 Tomcat 演示应用，用于端到端验证（只在隔离测试环境使用）
 server/                Go 管理平台（单二进制：Agent API + 控制台 API + 内嵌 Web 控制台，SQLite）
+  web/                 Vue SFC + TypeScript + Vite 8 控制台，构建产物内嵌至 Go
 deploy/                构建脚本、Agent 配置模板与默认策略
 docs/                  设计文档
 ```
@@ -61,21 +65,28 @@ RASP_ADMIN_PASSWORD='换成你的密码' ./dist/rasp-server -listen :8480 -db ra
 | Hook 点 | Servlet 入口（javax/jakarta）、JDBC Statement/Connection（任意驱动，按接口匹配）、ProcessImpl、FileInputStream/FileOutputStream、URL.openConnection、ObjectInputStream.resolveClass、InitialContext.lookup |
 | 检测 | 通用声明式规则引擎（条件：等于/包含/前缀/正则/集合/“包含用户输入”等）；`Detector` 接口供安全团队接入专用算法 |
 | 策略 | 关闭/观察/阻断三种模式，按类型设置开关和最高动作，URL 白名单，阻断页（HTML/JSON） |
-| 请求上下文 | 请求体被动采集（JSON 扁平化 / 表单 / multipart 文件名，上限 `body_max_bytes`，敏感字段脱敏）；ThreadPoolExecutor 异步任务继承请求上下文（`async_context`） |
+| 请求上下文 | 请求体被动采集（JSON 扁平化 / 表单 / multipart 文件名，上限 `body_max_bytes`，敏感字段脱敏）；异步任务继承请求上下文（`async_context`）：ThreadPoolExecutor、ForkJoinPool（并行流、CompletableFuture 默认池）、`new Thread(runnable)`；告警标注执行线程 |
 | 稳定性 | 全路径异常隔离、防重入、熔断（耗时/异常率）、DISABLE 文件、有界队列 |
 | 组件资产（SCA） | Agent 按已加载类的来源 jar 识别组件（pom.properties → MANIFEST → 文件名，支持 Spring Boot 嵌套 jar，附 SHA-1），变化时上报；平台“组件资产”页可筛选、看多版本、导出 CSV |
+| 组件漏洞匹配 | 离线导入 OSV 漏洞数据（GitHub Advisory 等，`rasp-server import-osv` 或 API 上传）；按 Maven 版本规则与 OSV 影响范围匹配全部在用组件，给出严重级别（数据库评级或 CVSS v3 计算）与修复版本；Agent 上报后自动重新匹配；新发现的高危/严重漏洞推送 Webhook；接口见 `/api/v1/vulns/*`（控制台页面尚未接入） |
 | 策略签名 | 平台下发的配置用 ECDSA P-256 签名，Agent 用固定公钥验签；绑定应用、防回滚、缓存启动时重新验签；失败保留旧配置并在心跳中上报；支持多公钥轮换 |
+| 运维 | `tools/install.sh` 安装/升级（保留配置、备份旧版、原子替换 jar、可写入 Tomcat `setenv.sh`）；`tools/uninstall.sh`（检测运行中的 JVM，默认保留配置与日志）；`VERSION` 记录版本、提交与构建时间 |
+| 阻断二次确认 | 策略会让规则开始阻断时，平台返回待确认清单（规则、在线实例数），需输入应用名称确认；审计记录确认的规则 |
 | 平台 | 应用/实例/告警/策略/白名单/紧急开关/Webhook 通知/审计；HMAC 签名、防重放 |
+| 账号与权限 | 多用户，`viewer` / `operator` / `admin` 三级角色，所有 API 按角色校验（写操作默认至少 `operator`）；PBKDF2 口令、会话与 API Token 只存哈希、重启不丢失；登录失败锁定（15 分钟 10 次）；`rasp-server user` 命令行管理 |
+| 运维与可靠性 | `/healthz`、`/readyz`、Prometheus `/metrics`（独立内网端口）；每应用告警限流；`rasp-server backup` 在线备份（含签名私钥）；启动安全检查；告警汇总表（总览统计毫秒级）；systemd 单元、Dockerfile、GitHub Actions CI |
 
-**已知限制**：请求体只在业务代码读取时采集（被动拷贝，不预读）；不带 pom/MANIFEST 元数据的 uber jar 只能识别为一个组件。
+**已知限制**：漏洞匹配只覆盖带 groupId 和版本号的组件（没有 pom.properties 的 jar 计为“无法匹配”）；请求体只在业务代码读取时采集（被动拷贝，不预读）；重写了 `run()` 的 Thread 子类、虚拟线程和自研调度器不传递上下文，请求中懒启动的常驻线程会一直沿用启动它的请求上下文；不带 pom/MANIFEST 元数据的 uber jar 只能识别为一个组件。
 
-**尚未实现**（见各章设计）：各攻击类型的专用检测算法（第 5 章，待安全团队编写）；内存马检测；组件漏洞库匹配（目前只有清单，无 CVE 关联）；ForkJoinPool / CompletableFuture 默认池与裸 `new Thread` 的上下文传递；RBAC 多用户与 SSO；ClickHouse/Kafka 的规模化部署形态；JDK 8 支持。
+**尚未实现**（见各章设计）：各攻击类型的专用检测算法（第 5 章，待安全团队编写）；内存马检测；控制台的漏洞页面（后端接口已就绪）；SSO（LDAP/OIDC）；控制台的用户管理、Token 与漏洞页面（后端接口已就绪）；ClickHouse/Kafka 的规模化部署形态；JDK 8 支持。
 
 ## 开发与测试
 
 ```bash
 (cd agent-java && mvn -B clean package)   # Agent 构建 + 单元测试（clean 不能省：避免 shade 重复打包）
+(cd server/web && npm ci && npm run build) # 前端类型检查 + 构建（Go embed 前置）
 (cd server && go vet ./... && go test ./...)  # 平台测试
+(cd server/web && npm run test:e2e)         # 真实 Go API 的浏览器端到端测试
 ./deploy/build.sh                         # 一次性构建并组装 dist/
 ```
 
@@ -83,14 +94,15 @@ RASP_ADMIN_PASSWORD='换成你的密码' ./dist/rasp-server -listen :8480 -db ra
 - `demo-app` 含故意写成不安全的接口，**只在隔离的测试环境运行**，不要部署到任何可被访问的网络。
 - 不要提交 `dist/`、`*.db`、`rasp-sign.key*`（已在 `.gitignore` 中）；签名私钥只放在平台服务器上并单独备份。
 - 修改 Agent 与平台之间的协议时，同步更新第 7 章，并保证新 Agent 能连旧平台、旧 Agent 能连新平台。
+- 前端架构、独立开发与浏览器验证见 [控制台说明](server/web/README.md)。
 
 ## 路线图
 
 | 优先级 | 事项 |
 |---|---|
 | P0 | 专用检测算法（第 5 章，安全团队）；观察模式试点与误报治理 |
-| P1 | RBAC 多用户 / SSO；下发阻断配置二次确认；组件漏洞库（CVE）匹配 |
-| P2 | ForkJoinPool / CompletableFuture / 裸 Thread 上下文传递；内存马检测；安装/卸载脚本 |
+| P1 | SSO（LDAP/OIDC）；控制台补齐用户/Token/漏洞页面；漏洞数据定时自动更新 |
+| P2 | 内存马检测；WebLogic/WebSphere 等中间件的自动接入 |
 | P3 | ClickHouse/Kafka 规模化部署；JDK 8 支持；其他语言 Agent |
 
 ## 设计文档
@@ -113,6 +125,7 @@ RASP_ADMIN_PASSWORD='换成你的密码' ./dist/rasp-server -listen :8480 -db ra
 | 10 | [测试方案](docs/10-测试方案.md) | 单元/集成/兼容性/攻防/性能测试 | 测试、开发 |
 | 11 | [开发计划与里程碑](docs/11-开发计划与里程碑.md) | 阶段划分、人力、风险 | 管理、全员 |
 | 12 | [参考资料](docs/12-参考资料.md) | 开源项目、文章、规范 | 全员 |
+| 13 | [上线检查清单](docs/13-上线检查清单.md) | 上线前提、部署检查、监控告警、实测容量、已知限制 | 运维、负责人 |
 
 ## 一句话理解 RASP
 

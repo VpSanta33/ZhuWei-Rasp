@@ -14,6 +14,22 @@ func TestDefaultPolicyIsValid(t *testing.T) {
 	}
 }
 
+func TestNewlyBlocking(t *testing.T) {
+	monitor := `{"mode":"monitor","rules":[{"id":"a","type":"sql","action":"block"}]}`
+	block := `{"mode":"block","checks":{"command":{"action":"log"}},"rules":[` +
+		`{"id":"a","type":"sql","action":"block"},{"id":"b","type":"command","action":"block"},` +
+		`{"id":"c","type":"ssrf","action":"log"},{"id":"d","type":"jndi","action":"block","enabled":false}]}`
+	if got := NewlyBlocking(monitor, block); strings.Join(got, ",") != "a" {
+		t.Fatalf("monitor->block = %v, want [a]", got)
+	}
+	if got := NewlyBlocking(block, block); len(got) != 0 {
+		t.Fatalf("unchanged policy needs no confirmation: %v", got)
+	}
+	if got := NewlyBlocking(block, monitor); len(got) != 0 {
+		t.Fatalf("relaxing needs no confirmation: %v", got)
+	}
+}
+
 func TestValidateRejects(t *testing.T) {
 	cases := map[string]string{
 		`{"mode":"bogus"}`:                      "mode",

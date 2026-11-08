@@ -26,7 +26,11 @@ public final class HookPoint {
         /** ThreadPoolExecutor.beforeExecute: install the task's context on the worker thread. */
         ASYNC_BEFORE,
         /** ThreadPoolExecutor.afterExecute: remove it again. */
-        ASYNC_AFTER
+        ASYNC_AFTER,
+        /** Thread.start / ForkJoinTask constructor: remember the creator's request context for {@code self}. */
+        TASK_CREATE,
+        /** Thread.run / ForkJoinTask.doExec: install the context for the duration of the call (exit restores). */
+        TASK_RUN
     }
 
     /** Converts the raw hooked call into named check parameters. */

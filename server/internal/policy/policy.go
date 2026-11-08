@@ -115,6 +115,49 @@ func Validate(raw string) (string, error) {
 	return string(b), nil
 }
 
+// BlockingRules returns the ids of the rules that would actually block in this policy: mode is block,
+// the rule is enabled with action block, and its check type is enabled with a block cap. Defaults
+// mirror the agent (rule action log, rule/check enabled, check cap block).
+func BlockingRules(raw string) []string {
+	var m map[string]any
+	if json.Unmarshal([]byte(raw), &m) != nil || m["mode"] != "block" {
+		return nil
+	}
+	checks, _ := m["checks"].(map[string]any)
+	rules, _ := m["rules"].([]any)
+	out := []string{}
+	for _, r := range rules {
+		rm, _ := r.(map[string]any)
+		if rm == nil || rm["enabled"] == false || rm["action"] != "block" {
+			continue
+		}
+		t, _ := rm["type"].(string)
+		c, _ := checks[t].(map[string]any)
+		if c != nil && (c["enabled"] == false || (c["action"] != nil && c["action"] != "block")) {
+			continue
+		}
+		id, _ := rm["id"].(string)
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// NewlyBlocking lists rules that block in next but not in prev: changes that need explicit confirmation.
+func NewlyBlocking(prev, next string) []string {
+	had := map[string]bool{}
+	for _, id := range BlockingRules(prev) {
+		had[id] = true
+	}
+	out := []string{}
+	for _, id := range BlockingRules(next) {
+		if !had[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // Effective composes the config delivered to agents of an app.
 func Effective(app *store.App, wl []*store.Whitelist, killSwitch bool) (map[string]any, string) {
 	var m map[string]any

@@ -26,6 +26,11 @@ func Fail(w http.ResponseWriter, status int, msg string) {
 	write(w, status, Envelope{Code: status, Message: msg})
 }
 
+// FailData is Fail with a data payload (e.g. what the client has to confirm).
+func FailData(w http.ResponseWriter, status int, msg string, data any) {
+	write(w, status, Envelope{Code: status, Message: msg, Data: data})
+}
+
 func write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)

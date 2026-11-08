@@ -7,6 +7,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist"
 
+echo "==> building web console (Node.js >=22.12 required)"
+(cd "$ROOT/server/web" && npm ci --no-audit --no-fund && npm run build)
+
 echo "==> building java agent"
 # clean: maven-shade would otherwise re-shade its own output on repeated builds
 (cd "$ROOT/agent-java" && mvn -q -B clean package)
@@ -21,6 +24,12 @@ cp "$ROOT/agent-java/rasp-launcher/target/rasp-launcher.jar" \
    "$ROOT/agent-java/rasp-core/target/rasp-core.jar" "$DIST/rasp/"
 cp "$ROOT/deploy/agent-conf/"* "$DIST/rasp/conf/"
 cp "$ROOT/agent-java/demo-app/target/demo-app.jar" "$DIST/"
+VERSION="$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' "$ROOT/agent-java/pom.xml" | head -1)"
+{
+  echo "version=$VERSION"
+  echo "commit=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$ROOT" diff --quiet HEAD 2>/dev/null || echo -dirty)"
+  echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$DIST/rasp/VERSION"
 
 if [ -d "$ROOT/server" ] && command -v go >/dev/null; then
   echo "==> building server"

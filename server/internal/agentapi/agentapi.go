@@ -12,12 +12,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"zhuwei-rasp/server/internal/httpx"
+	"zhuwei-rasp/server/internal/ops"
 	"zhuwei-rasp/server/internal/policy"
 	"zhuwei-rasp/server/internal/signing"
 	"zhuwei-rasp/server/internal/store"
@@ -35,6 +37,43 @@ type API struct {
 	nonces sync.Map // nonce -> unix millis
 	notify *Notifier
 	signer *signing.Signer
+	// OnDependencies runs after an agent's component inventory is stored (vulnerability rematch).
+	OnDependencies func()
+	// AlarmRate is the sustained number of alarm events per second accepted per application (burst = 10x).
+	// Excess events are dropped (they remain in the agent's local alarm.log); 0 disables the limit.
+	AlarmRate float64
+
+	bucketsMu sync.Mutex
+	buckets   map[int64]*bucket
+}
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+// take returns how many of n events the app may store now.
+func (a *API) take(appID int64, n int) int {
+	if a.AlarmRate <= 0 {
+		return n
+	}
+	a.bucketsMu.Lock()
+	defer a.bucketsMu.Unlock()
+	if a.buckets == nil {
+		a.buckets = map[int64]*bucket{}
+	}
+	burst := a.AlarmRate * 10
+	b := a.buckets[appID]
+	now := time.Now()
+	if b == nil {
+		b = &bucket{tokens: burst, last: now}
+		a.buckets[appID] = b
+	}
+	b.tokens = min(burst, b.tokens+now.Sub(b.last).Seconds()*a.AlarmRate)
+	b.last = now
+	allowed := min(n, int(b.tokens))
+	b.tokens -= float64(allowed)
+	return allowed
 }
 
 func New(st *store.Store, n *Notifier, signer *signing.Signer) *API {
@@ -77,6 +116,9 @@ func (a *API) dependencies(w http.ResponseWriter, r *http.Request, c *reqCtx) {
 		httpx.Fail(w, http.StatusInternalServerError, "store error")
 		return
 	}
+	if a.OnDependencies != nil {
+		a.OnDependencies()
+	}
 	httpx.OK(w, map[string]any{"accepted": len(items)})
 }
 
@@ -91,6 +133,7 @@ type handler func(w http.ResponseWriter, r *http.Request, c *reqCtx)
 // auth verifies X-Rasp-Sign = hex(HMAC-SHA256(secret, METHOD\nPATH\nTS\nNONCE\nhex(SHA256(body)))).
 func (a *API) auth(h handler, requireKnownAgent bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ops.AgentRequests.Inc(strings.TrimPrefix(r.URL.Path, "/agent/v1/"))
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 		if err != nil || len(body) > maxBody {
 			httpx.Fail(w, http.StatusRequestEntityTooLarge, "body too large")
@@ -280,16 +323,26 @@ func (a *API) alarms(w http.ResponseWriter, r *http.Request, c *reqCtx) {
 		}
 		out = append(out, al)
 	}
+	dropped := 0
+	if allowed := a.take(c.app.ID, len(out)); allowed < len(out) {
+		// keep the most important events: blocks before logs
+		sort.SliceStable(out, func(i, j int) bool { return out[i].Action == "block" && out[j].Action != "block" })
+		dropped = len(out) - allowed
+		out = out[:allowed]
+		ops.AlarmsDropped.Add("", int64(dropped))
+		log.Printf("app %s: alarm rate limit reached, dropped %d events", c.app.Name, dropped)
+	}
 	if err := a.st.InsertAlarms(out); err != nil {
 		log.Printf("insert alarms: %v", err)
 		httpx.Fail(w, http.StatusInternalServerError, "store error")
 		return
 	}
+	ops.AlarmsIngested.Add("", int64(len(out)))
 	for _, al := range out {
 		al.AppName = c.app.Name
 		a.notify.Alarm(al)
 	}
-	httpx.OK(w, map[string]any{"accepted": len(out)})
+	httpx.OK(w, map[string]any{"accepted": len(out), "dropped": dropped})
 }
 
 func (a *API) effective(app *store.App) (map[string]any, string) {

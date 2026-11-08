@@ -2,14 +2,12 @@
 package console
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"zhuwei-rasp/server/internal/agentapi"
@@ -17,43 +15,42 @@ import (
 	"zhuwei-rasp/server/internal/policy"
 	"zhuwei-rasp/server/internal/signing"
 	"zhuwei-rasp/server/internal/store"
+	"zhuwei-rasp/server/internal/vuln"
 )
 
 const (
-	sessionTTL    = 12 * time.Hour
 	onlineWindow  = 3 * agentapi.HeartbeatSec * time.Second
 	maxConsoleReq = 1 << 20
 )
 
-type session struct {
-	user    string
-	expires time.Time
-}
-
 type API struct {
-	st        *store.Store
-	adminUser string
-	adminPass string
-	agentURL  string
-	signer    *signing.Signer
+	st       *store.Store
+	agentURL string
+	signer   *signing.Signer
+	// Vulns imports advisories and rematches components; set by main (nil disables import/rematch).
+	Vulns *vuln.Service
 
-	mu       sync.Mutex
-	sessions map[string]session
-	failures map[string]int
+	limit *limiter
 }
 
 // New creates the console API. agentURL is the address agents should use (shown in install snippets).
-func New(st *store.Store, adminUser, adminPass, agentURL string, signer *signing.Signer) *API {
-	return &API{st: st, adminUser: adminUser, adminPass: adminPass, agentURL: agentURL, signer: signer,
-		sessions: map[string]session{}, failures: map[string]int{}}
+// Users, roles and tokens live in the store; see auth.go.
+func New(st *store.Store, agentURL string, signer *signing.Signer) *API {
+	return &API{st: st, agentURL: agentURL, signer: signer, limit: newLimiter()}
 }
 
 func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/login", a.login)
-	mux.HandleFunc("POST /api/v1/logout", a.auth(a.logout))
-	mux.HandleFunc("GET /api/v1/me", a.auth(func(w http.ResponseWriter, r *http.Request, user string) {
-		httpx.OK(w, map[string]string{"user": user})
-	}))
+	mux.HandleFunc("POST /api/v1/logout", a.authAs(store.RoleViewer, a.logout))
+	mux.HandleFunc("GET /api/v1/me", a.auth(a.me))
+	mux.HandleFunc("PUT /api/v1/me/password", a.authAs(store.RoleViewer, a.changeOwnPassword))
+	mux.HandleFunc("GET /api/v1/tokens", a.auth(a.listTokens))
+	mux.HandleFunc("POST /api/v1/tokens", a.authAs(store.RoleViewer, a.createToken))
+	mux.HandleFunc("DELETE /api/v1/tokens/{id}", a.authAs(store.RoleViewer, a.deleteToken))
+	mux.HandleFunc("GET /api/v1/users", a.admin(a.listUsers))
+	mux.HandleFunc("POST /api/v1/users", a.admin(a.createUser))
+	mux.HandleFunc("PUT /api/v1/users/{name}", a.admin(a.updateUser))
+	mux.HandleFunc("DELETE /api/v1/users/{name}", a.admin(a.deleteUser))
 
 	mux.HandleFunc("GET /api/v1/stats", a.auth(a.stats))
 	mux.HandleFunc("GET /api/v1/signing", a.auth(func(w http.ResponseWriter, r *http.Request, user string) {
@@ -63,7 +60,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/apps", a.auth(a.listApps))
 	mux.HandleFunc("POST /api/v1/apps", a.auth(a.createApp))
 	mux.HandleFunc("GET /api/v1/apps/{id}", a.auth(a.getApp))
-	mux.HandleFunc("DELETE /api/v1/apps/{id}", a.auth(a.deleteApp))
+	mux.HandleFunc("DELETE /api/v1/apps/{id}", a.admin(a.deleteApp))
 	mux.HandleFunc("GET /api/v1/apps/{id}/policy", a.auth(a.getPolicy))
 	mux.HandleFunc("PUT /api/v1/apps/{id}/policy", a.auth(a.putPolicy))
 	mux.HandleFunc("GET /api/v1/apps/{id}/effective", a.auth(a.effective))
@@ -84,73 +81,11 @@ func (a *API) Register(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/v1/components", a.auth(a.listComponents))
 	mux.HandleFunc("GET /api/v1/components/uses", a.auth(a.componentUses))
+	a.registerVulns(mux)
 
 	mux.HandleFunc("GET /api/v1/settings", a.auth(a.getSettings))
-	mux.HandleFunc("PUT /api/v1/settings", a.auth(a.putSettings))
-	mux.HandleFunc("GET /api/v1/audit", a.auth(a.listAudit))
-}
-
-// ------------------------------------------------------------------ auth
-
-type authed func(w http.ResponseWriter, r *http.Request, user string)
-
-func (a *API) auth(h authed) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		a.mu.Lock()
-		s, ok := a.sessions[tok]
-		if ok && time.Now().After(s.expires) {
-			delete(a.sessions, tok)
-			ok = false
-		}
-		a.mu.Unlock()
-		if tok == "" || !ok {
-			httpx.Fail(w, http.StatusUnauthorized, "login required")
-			return
-		}
-		h(w, r, s.user)
-	}
-}
-
-func (a *API) login(w http.ResponseWriter, r *http.Request) {
-	var req struct{ Username, Password string }
-	if err := httpx.ReadJSON(r, 4096, &req); err != nil {
-		httpx.Fail(w, http.StatusBadRequest, "invalid request")
-		return
-	}
-	ip := strings.Split(r.RemoteAddr, ":")[0]
-	a.mu.Lock()
-	fails := a.failures[ip]
-	a.mu.Unlock()
-	if fails >= 10 {
-		httpx.Fail(w, http.StatusTooManyRequests, "too many failed logins, restart server or wait")
-		return
-	}
-	userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(a.adminUser)) == 1
-	passOK := subtle.ConstantTimeCompare([]byte(req.Password), []byte(a.adminPass)) == 1
-	if !userOK || !passOK {
-		a.mu.Lock()
-		a.failures[ip]++
-		a.mu.Unlock()
-		time.Sleep(500 * time.Millisecond)
-		httpx.Fail(w, http.StatusUnauthorized, "wrong username or password")
-		return
-	}
-	tok := store.RandomHex(32)
-	a.mu.Lock()
-	delete(a.failures, ip)
-	a.sessions[tok] = session{user: req.Username, expires: time.Now().Add(sessionTTL)}
-	a.mu.Unlock()
-	a.st.AddAudit(req.Username, "login", ip, "")
-	httpx.OK(w, map[string]string{"token": tok, "user": req.Username})
-}
-
-func (a *API) logout(w http.ResponseWriter, r *http.Request, user string) {
-	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	a.mu.Lock()
-	delete(a.sessions, tok)
-	a.mu.Unlock()
-	httpx.OK(w, nil)
+	mux.HandleFunc("PUT /api/v1/settings", a.admin(a.putSettings))
+	mux.HandleFunc("GET /api/v1/audit", a.authAs(store.RoleOperator, a.listAudit))
 }
 
 func storeErr(w http.ResponseWriter, err error) {
@@ -251,6 +186,9 @@ func (a *API) getApp(w http.ResponseWriter, r *http.Request, _ string) {
 		storeErr(w, err)
 		return
 	}
+	if store.RoleRank(a.principal(r).Role) < store.RoleRank(store.RoleOperator) {
+		app.AppSecret = "<hidden: requires operator role>" // viewers can read setup instructions, not credentials
+	}
 	httpx.OK(w, a.withInstall(app))
 }
 
@@ -306,13 +244,29 @@ func (a *API) putPolicy(w http.ResponseWriter, r *http.Request, user string) {
 		httpx.Fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Turning on blocking is the one change that can break a live application: require the operator to
+	// confirm by typing the app name (header X-Rasp-Confirm), and say exactly which rules start blocking.
+	added := policy.NewlyBlocking(app.Policy, norm)
+	if len(added) > 0 && r.Header.Get("X-Rasp-Confirm") != app.Name {
+		var prev map[string]any
+		_ = json.Unmarshal([]byte(app.Policy), &prev)
+		httpx.FailData(w, http.StatusConflict, "confirm_required", map[string]any{
+			"app": app.Name, "env": app.Env, "rules": added, "prev_mode": prev["mode"],
+			"instances": a.onlineInstances(app.ID),
+		})
+		return
+	}
 	if err := a.st.UpdateAppPolicy(id, norm); err != nil {
 		storeErr(w, err)
 		return
 	}
 	var m map[string]any
 	_ = json.Unmarshal([]byte(norm), &m)
-	a.st.AddAudit(user, "update_policy", app.Name+"/"+app.Env, fmt.Sprintf("mode=%v", m["mode"]))
+	detail := fmt.Sprintf("mode=%v", m["mode"])
+	if len(added) > 0 {
+		detail += " confirmed_block=" + strings.Join(added, ",")
+	}
+	a.st.AddAudit(user, "update_policy", app.Name+"/"+app.Env, detail)
 	httpx.OK(w, nil)
 }
 
@@ -533,4 +487,19 @@ func (a *API) listAudit(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	httpx.OK(w, list)
+}
+
+// onlineInstances counts the app's agents that heartbeated recently (shown in the block confirmation).
+func (a *API) onlineInstances(appID int64) int {
+	list, err := a.st.ListInstances(appID, a.onlineSince())
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, i := range list {
+		if i.Online {
+			n++
+		}
+	}
+	return n
 }
